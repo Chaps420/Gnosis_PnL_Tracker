@@ -159,7 +159,7 @@
             resultsDiv.classList.add('loading');
 
             try {
-                const response = await fetch('http://localhost:5000/token_pnl', {
+                const response = await fetch('https://0965-2600-6c48-6e7f-7efb-1406-58d-9c3d-806c.ngrok-free.app/token_pnl', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ address, days })
