@@ -8,8 +8,11 @@ from collections import deque
 import logging
 import binascii
 
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+
+# Configure CORS to allow requests to '/token_pnl' from your GitHub Pages frontend
+CORS(app, resources={r"/token_pnl": {"origins": "https://chaps420.github.io"}})
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -174,6 +177,7 @@ def get_current_price(currency, issuer, transactions):
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
     """Calculate PNL for tokens in the specified wallet."""
+    logger.info("Received request to /token_pnl")
     data = request.json
     address = data.get('address')
     days = data.get('days', 0)
