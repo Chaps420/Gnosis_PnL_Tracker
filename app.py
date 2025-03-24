@@ -8,6 +8,7 @@ from collections import deque
 import logging
 import binascii
 
+# Initialize Flask app and enable CORS
 app = Flask(__name__)
 CORS(app)
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 JSON_RPC_URL = "https://s1.ripple.com:51234/"
 client = JsonRpcClient(JSON_RPC_URL)
 
+# Helper Functions
 def decode_currency(currency):
     """Decode a 40-character hex currency code to ASCII, if applicable."""
     try:
@@ -103,7 +105,6 @@ def get_historical_price(currency, issuer, transactions):
                     if (final_fields.get("Balance", {}).get("currency") == currency and 
                         (final_fields.get("HighLimit", {}).get("issuer") == issuer or 
                          final_fields.get("LowLimit", {}).get("issuer") == issuer)):
-                        # Simplified: Assuming transaction involves XRP and token
                         if "delivered_amount" in tx["meta"]:
                             delivered = tx["meta"]["delivered_amount"]
                             if isinstance(delivered, dict) and delivered.get("currency") == "XRP":
@@ -116,7 +117,7 @@ def get_historical_price(currency, issuer, transactions):
 def get_current_price(currency, issuer, transactions):
     """Fetch current price from DEX with historical fallback."""
     try:
-        # Try DEX first: Buy offers (pay XRP, get token)
+        # Buy offers (pay XRP, get token)
         req_buy = BookOffers(
             taker_pays={"currency": "XRP"},
             taker_gets={"currency": currency, "issuer": issuer},
@@ -164,16 +165,16 @@ def get_current_price(currency, issuer, transactions):
 
     except Exception as e:
         logger.error(f"Error fetching DEX price for {currency}-{issuer}: {e}")
-        # Fallback to historical price on error
         hist_price = get_historical_price(currency, issuer, transactions)
         if hist_price:
             logger.info(f"Using historical price (error fallback) for {currency}-{issuer}: {hist_price}")
             return hist_price
         return None
 
+# API Endpoint
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
-    """Calculate PNL for tokens in the specified wallet."""
+    """Calculate PNL for tokens in the specified wallet and sort by current value in descending order."""
     data = request.json
     address = data.get('address')
     days = data.get('days', 0)
@@ -272,7 +273,7 @@ def get_token_pnl():
                 unrealized_pnl = current_value - cost_basis
                 total_pnl = realized_pnl + unrealized_pnl
             else:
-                current_value = None
+                current_value = 0  # No price data available
                 unrealized_pnl = None
                 total_pnl = None
 
@@ -288,10 +289,17 @@ def get_token_pnl():
                 'total_pnl': total_pnl
             })
 
+        # Sort token_pnl by current_value in descending order
+        token_pnl.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
+
         return jsonify({'tokens': token_pnl})
+    except xrpl.clients.XrplException as e:
+        logger.error(f"XRPL error: {e}")
+        return jsonify({'error': f"XRPL error: {str(e)}"}), 503
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+# Run the app
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
