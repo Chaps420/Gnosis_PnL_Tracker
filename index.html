@@ -180,13 +180,11 @@
                                     <th><span>Realized PNL</span><span>(XRP)</span></th>
                                     <th><span>Unrealized PNL</span><span>(XRP)</span></th>
                                     <th><span>Total PNL</span><span>(XRP)</span></th>
-                                    <th><span>Ownership Percentage</span></th>
                                 </tr>`;
                         data.tokens.forEach(token => {
                             const currentValue = token.current_value === null ? 'N/A' : token.current_value.toFixed(6);
                             const unrealizedPnl = token.unrealized_pnl === null ? 'N/A' : token.unrealized_pnl.toFixed(6);
                             const totalPnl = token.total_pnl === null ? 'N/A' : token.total_pnl.toFixed(6);
-                            const ownershipPercentage = token.ownership_percentage === null ? 'N/A' : token.ownership_percentage.toFixed(2) + '%';
                             output += `<tr>
                                 <td>${token.currency} (Issuer: ${token.issuer.slice(0, 10)}...)</td>
                                 <td>${token.amount_held.toFixed(6)}</td>
@@ -195,7 +193,6 @@
                                 <td>${token.realized_pnl.toFixed(6)}</td>
                                 <td>${unrealizedPnl}</td>
                                 <td>${totalPnl}</td>
-                                <td>${ownershipPercentage}</td>
                             </tr>`;
                         });
                         output += '</table>';
