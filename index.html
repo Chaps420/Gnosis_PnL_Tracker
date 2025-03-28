@@ -170,6 +170,7 @@
                     if (data.tokens.length === 0) {
                         resultsDiv.innerHTML = 'No token holdings found for this wallet.';
                     } else {
+                        console.log('Tokens:', data.tokens); // Debug: Log the tokens array
                         let output = `<h3>Token PNL Analysis for: ${address}</h3>
                             <table>
                                 <tr>
@@ -182,15 +183,18 @@
                                     <th><span>Total PNL</span><span>(XRP)</span></th>
                                 </tr>`;
                         data.tokens.forEach(token => {
-                            const currentValue = token.current_value === null ? 'N/A' : token.current_value.toFixed(6);
-                            const unrealizedPnl = token.unrealized_pnl === null ? 'N/A' : token.unrealized_pnl.toFixed(6);
-                            const totalPnl = token.total_pnl === null ? 'N/A' : token.total_pnl.toFixed(6);
+                            const amountHeld = (token.amount_held !== undefined && token.amount_held !== null) ? token.amount_held.toFixed(6) : 'N/A';
+                            const initialInvestment = (token.initial_investment !== undefined && token.initial_investment !== null) ? token.initial_investment.toFixed(6) : 'N/A';
+                            const currentValue = (token.current_value !== undefined && token.current_value !== null) ? token.current_value.toFixed(6) : 'N/A';
+                            const realizedPnl = (token.realized_pnl !== undefined && token.realized_pnl !== null) ? token.realized_pnl.toFixed(6) : 'N/A';
+                            const unrealizedPnl = (token.unrealized_pnl !== undefined && token.unrealized_pnl !== null) ? token.unrealized_pnl.toFixed(6) : 'N/A';
+                            const totalPnl = (token.total_pnl !== undefined && token.total_pnl !== null) ? token.total_pnl.toFixed(6) : 'N/A';
                             output += `<tr>
-                                <td>${token.currency} (Issuer: ${token.issuer.slice(0, 10)}...)</td>
-                                <td>${token.amount_held.toFixed(6)}</td>
-                                <td>${token.initial_investment.toFixed(6)}</td>
+                                <td>${token.currency || 'N/A'} (Issuer: ${(token.issuer || '').slice(0, 10)}...)</td>
+                                <td>${amountHeld}</td>
+                                <td>${initialInvestment}</td>
                                 <td>${currentValue}</td>
-                                <td>${token.realized_pnl.toFixed(6)}</td>
+                                <td>${realizedPnl}</td>
                                 <td>${unrealizedPnl}</td>
                                 <td>${totalPnl}</td>
                             </tr>`;
