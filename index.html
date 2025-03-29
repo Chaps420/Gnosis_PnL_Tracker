@@ -126,6 +126,11 @@
         tr:hover {
             background-color: #444444;
         }
+        h4 {
+            color: #FFD700;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
@@ -167,10 +172,11 @@
 
                 const data = await response.json();
                 if (response.ok) {
-                    if (data.tokens.length === 0) {
-                        resultsDiv.innerHTML = 'No token holdings found for this wallet.';
-                    } else {
-                        let output = `<h3>Token PNL Analysis for: ${address}</h3>
+                    let output = `<h3>Token PNL Analysis for: ${address}</h3>`;
+
+                    // Regular Tokens Section
+                    if (data.tokens && data.tokens.length > 0) {
+                        output += `<h4>Regular Tokens</h4>
                             <table>
                                 <tr>
                                     <th><span>Token</span></th>
@@ -182,7 +188,6 @@
                                     <th><span>Total PNL</span><span>(XRP)</span></th>
                                 </tr>`;
                         data.tokens.forEach(token => {
-                            console.log('Processing token:', token);
                             const currency = token.currency || 'N/A';
                             const issuer = token.issuer ? token.issuer.slice(0, 10) + '...' : 'N/A';
                             const amountHeld = (token.amount_held !== undefined && token.amount_held !== null) ? token.amount_held.toFixed(6) : 'N/A';
@@ -202,8 +207,52 @@
                             </tr>`;
                         });
                         output += '</table>';
-                        resultsDiv.innerHTML = output;
+                    } else {
+                        output += '<p>No regular tokens found.</p>';
                     }
+
+                    // AMM LP Tokens Section
+                    if (data.amm_lp_tokens && data.amm_lp_tokens.length > 0) {
+                        output += `<h4>AMM LP Tokens</h4>
+                            <table>
+                                <tr>
+                                    <th><span>Token</span></th>
+                                    <th><span>Amount Held</span></th>
+                                    <th><span>Initial Investment</span><span>(XRP)</span></th>
+                                    <th><span>Current Value</span><span>(XRP)</span></th>
+                                    <th><span>Realized PNL</span><span>(XRP)</span></th>
+                                    <th><span>Unrealized PNL</span><span>(XRP)</span></th>
+                                    <th><span>Total PNL</span><span>(XRP)</span></th>
+                                </tr>`;
+                        data.amm_lp_tokens.forEach(token => {
+                            const currency = token.currency || 'N/A';
+                            const issuer = token.issuer ? token.issuer.slice(0, 10) + '...' : 'N/A';
+                            const amountHeld = (token.amount_held !== undefined && token.amount_held !== null) ? token.amount_held.toFixed(6) : 'N/A';
+                            const initialInvestment = (token.initial_investment !== undefined && token.initial_investment !== null) ? token.initial_investment.toFixed(6) : 'N/A';
+                            const currentValue = (token.current_value !== undefined && token.current_value !== null) ? token.current_value.toFixed(6) : 'N/A';
+                            const realizedPnl = (token.realized_pnl !== undefined && token.realized_pnl !== null) ? token.realized_pnl.toFixed(6) : 'N/A';
+                            const unrealizedPnl = (token.unrealized_pnl !== undefined && token.unrealized_pnl !== null) ? token.unrealized_pnl.toFixed(6) : 'N/A';
+                            const totalPnl = (token.total_pnl !== undefined && token.total_pnl !== null) ? token.total_pnl.toFixed(6) : 'N/A';
+                            output += `<tr>
+                                <td>${currency} (Issuer: ${issuer})</td>
+                                <td>${amountHeld}</td>
+                                <td>${initialInvestment}</td>
+                                <td>${currentValue}</td>
+                                <td>${realizedPnl}</td>
+                                <td>${unrealizedPnl}</td>
+                                <td>${totalPnl}</td>
+                            </tr>`;
+                        });
+                        output += '</table>';
+                    } else {
+                        output += '<p>No AMM LP tokens found.</p>';
+                    }
+
+                    if (!data.tokens.length && !data.amm_lp_tokens.length) {
+                        output = 'No token holdings found for this wallet.';
+                    }
+
+                    resultsDiv.innerHTML = output;
                 } else {
                     resultsDiv.innerHTML = `<span class="error">Error: ${data.error}</span>`;
                 }
