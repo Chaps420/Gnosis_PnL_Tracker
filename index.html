@@ -133,6 +133,20 @@
       margin-top: 20px;
       margin-bottom: 10px;
     }
+    #progress-bar {
+      width: 100%;
+      background-color: #333333;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 20px;
+      display: none;
+    }
+    #progress-bar div {
+      height: 20px;
+      background-color: #FFD700;
+      width: 0;
+      transition: width 0.3s;
+    }
   </style>
 </head>
 <body>
@@ -145,20 +159,19 @@
   <div class="input-container">
     <label for="walletAddress">Enter XRPL Wallet Address:</label>
     <input type="text" id="walletAddress" placeholder="r..." aria-label="XRPL Wallet Address" />
-    <label for="days">Enter Number of Days (0 for all time):</label>
-    <input type="number" id="days" placeholder="0" value="0" min="0" aria-label="Number of Days" />
     <button onclick="calculateTokenPNL()">Calculate Token PNL</button>
   </div>
+  <div id="progress-bar"><div></div></div>
   <div id="results" class="loading">Enter an address and click "Calculate Token PNL"</div>
 
   <script>
-    // Set the endpoint URL; update this if your backend endpoint changes.
     const API_ENDPOINT = 'https://7843-2600-1007-a011-2d61-e4c0-e5c3-e8e5-347.ngrok-free.app/token_pnl';
 
     async function calculateTokenPNL() {
       const address = document.getElementById('walletAddress').value.trim();
-      const days = parseInt(document.getElementById('days').value.trim()) || 0;
       const resultsDiv = document.getElementById('results');
+      const progressBar = document.getElementById('progress-bar');
+      const progressBarFill = progressBar.querySelector('div');
 
       if (!address) {
         resultsDiv.innerHTML = '<span class="error">Please enter a valid XRPL address</span>';
@@ -167,17 +180,33 @@
 
       resultsDiv.innerHTML = 'Loading token PNL...';
       resultsDiv.classList.add('loading');
+      progressBar.style.display = 'block';
+      progressBarFill.style.width = '0%';
 
       try {
         const response = await fetch(API_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address, days })
+          body: JSON.stringify({ address })
         });
+
+        // Simulate progress bar for demo purposes
+        let progress = 0;
+        const interval = setInterval(() => {
+          progress += 10;
+          progressBarFill.style.width = `${progress}%`;
+          if (progress >= 90) {
+            clearInterval(interval);
+          }
+        }, 100);
+
         const data = await response.json();
 
         if (response.ok) {
           let output = `<h3>Token PNL Analysis for: ${address}</h3>`;
+
+          // Show current XRP balance at the top
+          output += `<h4>Current XRP Balance: ${data.xrp_balance.toFixed(6)} XRP</h4>`;
 
           // Regular Tokens Section
           if (data.tokens && data.tokens.length > 0) {
@@ -265,6 +294,7 @@
         console.error('Error in calculateTokenPNL:', error);
         resultsDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
       } finally {
+        progressBar.style.display = 'none';
         resultsDiv.classList.remove('loading');
       }
     }
