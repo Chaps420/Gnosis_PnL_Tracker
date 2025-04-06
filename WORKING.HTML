@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RippleTrack XRPnL</title>
+  <style>
+    body {
+      font-family: 'Arial', sans-serif;
+      max-width: 1200px;
+      margin: 20px auto;
+      padding: 20px;
+      background-color: #000000;
+      color: #FFD700;
+    }
+    h1 {
+      color: #FFD700;
+      text-align: center;
+      margin-bottom: 40px;
+      font-size: 36px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+    }
+    .logo img {
+      width: 50px;
+      height: 50px;
+      margin-right: 10px;
+    }
+    .logo h1 {
+      margin: 0;
+      font-size: 24px;
+      color: #FFD700;
+    }
+    .input-container {
+      background: #1e1e1e;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(255, 215, 0, 0.3);
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: bold;
+      color: #FFD700;
+    }
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 15px;
+      border: 1px solid #FFD700;
+      border-radius: 4px;
+      box-sizing: border-box;
+      font-size: 16px;
+      background-color: #333333;
+      color: #FFD700;
+    }
+    button {
+      background-color: #FFD700;
+      color: #000000;
+      padding: 12px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      width: 100%;
+      font-size: 16px;
+      transition: background-color 0.3s ease;
+    }
+    button:hover {
+      background-color: #ffcc00;
+    }
+    #results {
+      background: #1e1e1e;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 4px 8px rgba(255, 215, 0, 0.3);
+      overflow-x: auto;
+    }
+    .loading {
+      font-style: italic;
+      color: #FFD700;
+      text-align: center;
+    }
+    .error {
+      color: #ff4c4c;
+      font-weight: bold;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    th,
+    td {
+      padding: 8px;
+      text-align: right;
+      border-bottom: 1px solid #FFD700;
+      white-space: nowrap;
+    }
+    th {
+      background-color: #333333;
+      color: #FFD700;
+      text-align: center;
+    }
+    th span {
+      display: block;
+      line-height: 1.2em;
+    }
+    td:first-child,
+    th:first-child {
+      text-align: left;
+    }
+    td {
+      color: #FFFFFF;
+    }
+    tr:nth-child(even) {
+      background-color: #2e2e2e;
+    }
+    tr:hover {
+      background-color: #444444;
+    }
+    h4 {
+      color: #FFD700;
+      margin-top: 20px;
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">
+      <img src="https://cdn.xrp.cafe/99287cfdc27d-4bca-9068-497940134d73.webp" alt="Logo" />
+      <h1>RippleTrack XRPnL</h1>
+    </div>
+  </div>
+  <div class="input-container">
+    <label for="walletAddress">Enter XRPL Wallet Address:</label>
+    <input type="text" id="walletAddress" placeholder="r..." aria-label="XRPL Wallet Address" />
+    <label for="days">Enter Number of Days (0 for all time):</label>
+    <input type="number" id="days" placeholder="0" value="0" min="0" aria-label="Number of Days" />
+    <button onclick="calculateTokenPNL()">Calculate Token PNL</button>
+  </div>
+  <div id="results" class="loading">Enter an address and click "Calculate Token PNL"</div>
+
+  <script>
+    // Set the endpoint URL; update this if your backend endpoint changes.
+    const API_ENDPOINT = 'https://7843-2600-1007-a011-2d61-e4c0-e5c3-e8e5-347.ngrok-free.app/token_pnl';
+
+    async function calculateTokenPNL() {
+      const address = document.getElementById('walletAddress').value.trim();
+      const days = parseInt(document.getElementById('days').value.trim()) || 0;
+      const resultsDiv = document.getElementById('results');
+
+      if (!address) {
+        resultsDiv.innerHTML = '<span class="error">Please enter a valid XRPL address</span>';
+        return;
+      }
+
+      resultsDiv.innerHTML = 'Loading token PNL...';
+      resultsDiv.classList.add('loading');
+
+      try {
+        const response = await fetch(API_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address, days })
+        });
+        const data = await response.json();
+
+        if (response.ok) {
+          let output = `<h3>Token PNL Analysis for: ${address}</h3>`;
+
+          // Regular Tokens Section
+          if (data.tokens && data.tokens.length > 0) {
+            output += `<h4>Regular Tokens</h4>
+              <table>
+                <tr>
+                  <th><span>Token</span></th>
+                  <th><span>Amount Held</span></th>
+                  <th><span>Initial Investment</span><span>(XRP)</span></th>
+                  <th><span>Current Value</span><span>(XRP)</span></th>
+                  <th><span>Realized PNL</span><span>(XRP)</span></th>
+                  <th><span>Unrealized PNL</span><span>(XRP)</span></th>
+                  <th><span>Total PNL</span><span>(XRP)</span></th>
+                </tr>`;
+            data.tokens.forEach(token => {
+              const currency = token.currency || 'N/A';
+              const issuer = token.issuer ? token.issuer.slice(0, 10) + '...' : 'N/A';
+              const amountHeld = token.amount_held != null ? token.amount_held.toFixed(6) : 'N/A';
+              const initialInvestment = token.initial_investment != null ? token.initial_investment.toFixed(6) : 'N/A';
+              const currentValue = token.current_value != null ? token.current_value.toFixed(6) : 'N/A';
+              const realizedPnl = token.realized_pnl != null ? token.realized_pnl.toFixed(6) : 'N/A';
+              const unrealizedPnl = token.unrealized_pnl != null ? token.unrealized_pnl.toFixed(6) : 'N/A';
+              const totalPnl = token.total_pnl != null ? token.total_pnl.toFixed(6) : 'N/A';
+              output += `<tr>
+                <td>${currency} (Issuer: ${issuer})</td>
+                <td>${amountHeld}</td>
+                <td>${initialInvestment}</td>
+                <td>${currentValue}</td>
+                <td>${realizedPnl}</td>
+                <td>${unrealizedPnl}</td>
+                <td>${totalPnl}</td>
+              </tr>`;
+            });
+            output += '</table>';
+          } else {
+            output += '<p>No regular tokens found.</p>';
+          }
+
+          // AMM LP Tokens Section
+          if (data.amm_lp_tokens && data.amm_lp_tokens.length > 0) {
+            output += `<h4>AMM LP Tokens</h4>
+              <table>
+                <tr>
+                  <th><span>Token</span></th>
+                  <th><span>Amount Held</span></th>
+                  <th><span>Initial Investment</span><span>(XRP)</span></th>
+                  <th><span>Current Value</span><span>(XRP)</span></th>
+                  <th><span>Realized PNL</span><span>(XRP)</span></th>
+                  <th><span>Unrealized PNL</span><span>(XRP)</span></th>
+                  <th><span>Total PNL</span><span>(XRP)</span></th>
+                </tr>`;
+            data.amm_lp_tokens.forEach(token => {
+              const currency = token.currency || 'N/A';
+              const issuer = token.issuer ? token.issuer.slice(0, 10) + '...' : 'N/A';
+              const amountHeld = token.amount_held != null ? token.amount_held.toFixed(6) : 'N/A';
+              const initialInvestment = token.initial_investment != null ? token.initial_investment.toFixed(6) : 'N/A';
+              const currentValue = token.current_value != null ? token.current_value.toFixed(6) : 'N/A';
+              const realizedPnl = token.realized_pnl != null ? token.realized_pnl.toFixed(6) : 'N/A';
+              const unrealizedPnl = token.unrealized_pnl != null ? token.unrealized_pnl.toFixed(6) : 'N/A';
+              const totalPnl = token.total_pnl != null ? token.total_pnl.toFixed(6) : 'N/A';
+              output += `<tr>
+                <td>${currency} (Issuer: ${issuer})</td>
+                <td>${amountHeld}</td>
+                <td>${initialInvestment}</td>
+                <td>${currentValue}</td>
+                <td>${realizedPnl}</td>
+                <td>${unrealizedPnl}</td>
+                <td>${totalPnl}</td>
+              </tr>`;
+            });
+            output += '</table>';
+          } else {
+            output += '<p>No AMM LP tokens found.</p>';
+          }
+
+          if (!data.tokens.length && !data.amm_lp_tokens.length) {
+            output = 'No token holdings found for this wallet.';
+          }
+
+          resultsDiv.innerHTML = output;
+        } else {
+          resultsDiv.innerHTML = `<span class="error">Error: ${data.error}</span>`;
+        }
+      } catch (error) {
+        console.error('Error in calculateTokenPNL:', error);
+        resultsDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+      } finally {
+        resultsDiv.classList.remove('loading');
+      }
+    }
+  </script>
+</body>
+</html>
