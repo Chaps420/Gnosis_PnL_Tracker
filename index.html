@@ -133,19 +133,37 @@
       margin-top: 20px;
       margin-bottom: 10px;
     }
-    #progress-bar {
-      width: 100%;
-      background-color: #333333;
-      border-radius: 4px;
-      overflow: hidden;
-      margin-bottom: 20px;
-      display: none;
+    .ads-container {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 20px;
     }
-    #progress-bar div {
-      height: 20px;
+    .ad-box {
+      background-color: #333333;
+      color: #FFD700;
+      padding: 20px;
+      text-align: center;
+      border-radius: 8px;
+      width: 32%;
+      box-shadow: 0 4px 8px rgba(255, 215, 0, 0.3);
+    }
+    .ad-box img {
+      max-width: 100%;
+      border-radius: 8px;
+    }
+    .ad-box button {
       background-color: #FFD700;
-      width: 0;
-      transition: width 0.3s;
+      color: #000000;
+      padding: 12px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+      margin-top: 10px;
+      transition: background-color 0.3s ease;
+    }
+    .ad-box button:hover {
+      background-color: #ffcc00;
     }
   </style>
 </head>
@@ -161,8 +179,21 @@
     <input type="text" id="walletAddress" placeholder="r..." aria-label="XRPL Wallet Address" />
     <button onclick="calculateTokenPNL()">Calculate Token PNL</button>
   </div>
-  <div id="progress-bar"><div></div></div>
   <div id="results" class="loading">Enter an address and click "Calculate Token PNL"</div>
+  
+  <div class="ads-container">
+    <div class="ad-box">
+      <img src="https://ipfs.firstledger.net/ipfs/QmVCcrS2BVGBcGAgmwaTtwEsM8peMAowTjKwzpdJQBQiaP" alt="Buy $UGA on First Ledger">
+      <div>Buy $UGA on First Ledger</div>
+      <button onclick="window.location.href='https://firstledger.net/token/rBFJGmWj6YaabVCxfsjiCM8pfYXs8xFdeC/UGA'">Buy Now</button>
+    </div>
+    <div class="ad-box">
+      <div>Coming Soon! Your Token!!</div>
+    </div>
+    <div class="ad-box">
+      <div>Coming Soon! Your Token!!</div>
+    </div>
+  </div>
 
   <script>
     const API_ENDPOINT = 'https://7843-2600-1007-a011-2d61-e4c0-e5c3-e8e5-347.ngrok-free.app/token_pnl';
@@ -170,8 +201,6 @@
     async function calculateTokenPNL() {
       const address = document.getElementById('walletAddress').value.trim();
       const resultsDiv = document.getElementById('results');
-      const progressBar = document.getElementById('progress-bar');
-      const progressBarFill = progressBar.querySelector('div');
 
       if (!address) {
         resultsDiv.innerHTML = '<span class="error">Please enter a valid XRPL address</span>';
@@ -180,8 +209,6 @@
 
       resultsDiv.innerHTML = 'Loading token PNL...';
       resultsDiv.classList.add('loading');
-      progressBar.style.display = 'block';
-      progressBarFill.style.width = '0%';
 
       try {
         const response = await fetch(API_ENDPOINT, {
@@ -189,16 +216,6 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ address })
         });
-
-        // Simulate progress bar for demo purposes
-        let progress = 0;
-        const interval = setInterval(() => {
-          progress += 10;
-          progressBarFill.style.width = `${progress}%`;
-          if (progress >= 90) {
-            clearInterval(interval);
-          }
-        }, 100);
 
         const data = await response.json();
 
@@ -291,7 +308,6 @@
         console.error('Error in calculateTokenPNL:', error);
         resultsDiv.innerHTML = `<span class="error">Error: ${error.message}</span>`;
       } finally {
-        progressBar.style.display = 'none';
         resultsDiv.classList.remove('loading');
       }
     }
