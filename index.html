@@ -205,9 +205,6 @@
         if (response.ok) {
           let output = `<h3>Token PNL Analysis for: ${address}</h3>`;
 
-          // Show current XRP balance at the top
-          output += `<h4>Current XRP Balance: ${data.xrp_balance.toFixed(6)} XRP</h4>`;
-
           // Regular Tokens Section
           if (data.tokens && data.tokens.length > 0) {
             output += `<h4>Regular Tokens</h4>
