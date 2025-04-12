@@ -1,6 +1,5 @@
-flask[async]
+flask
 flask-cors
 xrpl-py>=1.9.1
 requests
 gunicorn
-aiohttp
