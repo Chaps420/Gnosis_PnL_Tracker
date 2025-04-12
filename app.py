@@ -105,23 +105,28 @@ def get_balance_changes(meta, address):
                     changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
     return changes
 
+def get_dexscreener_price(decoded_currency):
+    """Fetch token price from DEX Screener API."""
+    try:
+        url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
+        logger.debug(f"Fetching price from DEX Screener: {url}")
+        response = requests.get(url, timeout=10).json()  # Increased timeout to 10 seconds
+        for pair in response.get('pairs', []):
+            if (pair.get('chainId') == 'xrpl' and 
+                pair.get('baseToken', {}).get('symbol') == decoded_currency and 
+                pair.get('quoteToken', {}).get('symbol') == 'XRP'):
+                return float(pair.get('priceNative', '0'))
+        return None
+    except requests.exceptions.Timeout:
+        logger.error(f"DEX Screener API timeout for {decoded_currency}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"DEX Screener API request error: {e}")
+        return None
+
 def get_current_price(currency, issuer, transactions):
     """Fetch current token price in XRP with fallbacks."""
     decoded_currency = decode_hex_currency(currency)
-
-    def get_dexscreener_price():
-        try:
-            url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
-            response = requests.get(url, timeout=5).json()
-            for pair in response.get('pairs', []):
-                if (pair.get('chainId') == 'xrpl' and 
-                    pair.get('baseToken', {}).get('symbol') == decoded_currency and 
-                    pair.get('quoteToken', {}).get('symbol') == 'XRP'):
-                    return float(pair.get('priceNative', '0'))
-            return None
-        except Exception as e:
-            logger.error(f"DEX Screener error for {decoded_currency}-{issuer}: {e}")
-            return None
 
     def get_dex_price():
         try:
@@ -177,10 +182,12 @@ def get_current_price(currency, issuer, transactions):
         return sum(prices) / len(prices) if prices else None
 
     for method in (get_dexscreener_price, get_dex_price, get_historical_price):
-        price = method()
+        price = method(decoded_currency)
         if price and price > 0.000001:
             return price
-    return 0.000001
+
+    logger.warning(f"Unable to fetch price for {currency}-{issuer}, returning fallback value")
+    return 0.000001  # Fallback value
 
 def get_lp_token_value(issuer, amount_held, transactions):
     """Calculate LP token value based on AMM pool data."""
