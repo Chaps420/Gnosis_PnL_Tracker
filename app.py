@@ -124,65 +124,67 @@ def get_dexscreener_price(decoded_currency):
         logger.error(f"DEX Screener API request error: {e}")
         return None
 
+def get_dex_price(currency, issuer):
+    """Fetch price from XRPL DEX."""
+    try:
+        buy_offers = client.request(BookOffers(
+            taker_pays={"currency": "XRP"},
+            taker_gets={"currency": currency, "issuer": issuer},
+            limit=10
+        )).result.get("offers", [])
+        sell_offers = client.request(BookOffers(
+            taker_gets={"currency": "XRP"},
+            taker_pays={"currency": currency, "issuer": issuer},
+            limit=10
+        )).result.get("offers", [])
+
+        MIN_OFFERS, MIN_VOLUME = 2, 10000
+        buy_price = None
+        if len(buy_offers) >= MIN_OFFERS:
+            xrp = sum(float(o["TakerPays"]) / 1_000_000 for o in buy_offers)
+            tokens = sum(float(o["TakerGets"]["value"]) for o in buy_offers)
+            if tokens >= MIN_VOLUME:
+                buy_price = xrp / tokens
+        sell_price = None
+        if len(sell_offers) >= MIN_OFFERS:
+            xrp = sum(float(o["TakerGets"]) / 1_000_000 for o in sell_offers)
+            tokens = sum(float(o["TakerPays"]["value"]) for o in sell_offers)
+            if tokens >= MIN_VOLUME:
+                sell_price = xrp / tokens
+        if buy_price and sell_price:
+            return (buy_price + sell_price) / 2
+        return buy_price or sell_price or 0.000001
+    except Exception as e:
+        logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
+        return 0.000001
+
+def get_historical_price(decoded_currency, issuer, transactions):
+    """Fetch price from historical transactions."""
+    prices = []
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    for tx in transactions:
+        tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+        if tx_time < cutoff or not tx.get('meta') or "delivered_amount" not in tx["meta"]:
+            continue
+        meta = tx["meta"]
+        if isinstance(meta["delivered_amount"], dict) and meta["delivered_amount"]["currency"] == "XRP":
+            xrp = float(meta["delivered_amount"]["value"]) / 1_000_000
+            for node in meta.get("AffectedNodes", []):
+                if ("ModifiedNode" in node and 
+                    node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and 
+                    node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == decoded_currency and 
+                    node["ModifiedNode"].get("HighLimit", {}).get("issuer") == issuer):
+                    token = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
+                    if token != 0:
+                        prices.append(xrp / abs(token))
+    return sum(prices) / len(prices) if prices else None
+
 def get_current_price(currency, issuer, transactions):
     """Fetch current token price in XRP with fallbacks."""
     decoded_currency = decode_hex_currency(currency)
 
-    def get_dex_price():
-        try:
-            buy_offers = client.request(BookOffers(
-                taker_pays={"currency": "XRP"},
-                taker_gets={"currency": currency, "issuer": issuer},
-                limit=10
-            )).result.get("offers", [])
-            sell_offers = client.request(BookOffers(
-                taker_gets={"currency": "XRP"},
-                taker_pays={"currency": currency, "issuer": issuer},
-                limit=10
-            )).result.get("offers", [])
-
-            MIN_OFFERS, MIN_VOLUME = 2, 10000
-            buy_price = None
-            if len(buy_offers) >= MIN_OFFERS:
-                xrp = sum(float(o["TakerPays"]) / 1_000_000 for o in buy_offers)
-                tokens = sum(float(o["TakerGets"]["value"]) for o in buy_offers)
-                if tokens >= MIN_VOLUME:
-                    buy_price = xrp / tokens
-            sell_price = None
-            if len(sell_offers) >= MIN_OFFERS:
-                xrp = sum(float(o["TakerGets"]) / 1_000_000 for o in sell_offers)
-                tokens = sum(float(o["TakerPays"]["value"]) for o in sell_offers)
-                if tokens >= MIN_VOLUME:
-                    sell_price = xrp / tokens
-            if buy_price and sell_price:
-                return (buy_price + sell_price) / 2
-            return buy_price or sell_price or 0.000001
-        except Exception as e:
-            logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
-            return 0.000001
-
-    def get_historical_price():
-        prices = []
-        cutoff = datetime.utcnow() - timedelta(days=30)
-        for tx in transactions:
-            tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-            if tx_time < cutoff or not tx.get('meta') or "delivered_amount" not in tx["meta"]:
-                continue
-            meta = tx["meta"]
-            if isinstance(meta["delivered_amount"], dict) and meta["delivered_amount"]["currency"] == "XRP":
-                xrp = float(meta["delivered_amount"]["value"]) / 1_000_000
-                for node in meta.get("AffectedNodes", []):
-                    if ("ModifiedNode" in node and 
-                        node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and 
-                        node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == currency and 
-                        node["ModifiedNode"].get("HighLimit", {}).get("issuer") == issuer):
-                        token = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
-                        if token != 0:
-                            prices.append(xrp / abs(token))
-        return sum(prices) / len(prices) if prices else None
-
-    for method in (get_dexscreener_price, get_dex_price, get_historical_price):
-        price = method(decoded_currency)
+    for method in (lambda: get_dexscreener_price(decoded_currency), lambda: get_dex_price(currency, issuer), lambda: get_historical_price(decoded_currency, issuer, transactions)):
+        price = method()
         if price and price > 0.000001:
             return price
 
