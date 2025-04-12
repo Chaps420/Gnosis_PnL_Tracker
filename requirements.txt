@@ -3,3 +3,4 @@ flask-cors
 xrpl-py
 requests
 gunicorn
+aiohttp
