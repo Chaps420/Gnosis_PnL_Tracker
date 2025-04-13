@@ -194,18 +194,7 @@ def get_dexscreener_price(decoded_currency, batch_results=None, batch_index=None
         price_cache[cache_key] = price
         return price
     
-    # Try async fetch
-    try:
-        async def fetch():
-            async with aiohttp.ClientSession() as session:
-                return await fetch_dexscreener_price_async(session, decoded_currency)
-        price = asyncio.run_coroutine_threadsafe(fetch(), asyncio.get_event_loop()).result()
-        price_cache[cache_key] = price
-        return price
-    except Exception as e:
-        logger.error(f"DEX Screener async failed for {decoded_currency}: {e}, falling back to sync")
-        # Fallback to sync
-        return get_dexscreener_price_sync(decoded_currency)
+    return get_dexscreener_price_sync(decoded_currency)
 
 def get_dex_price(currency, issuer):
     """Fetch price from XRPL DEX."""
@@ -328,8 +317,8 @@ def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
         elif isinstance(asset2, str):
             amount_xrp = float(asset2) / 1_000_000
             token_currency = asset1["currency"]
-            token_issuer = asset1["issuer"]
-            amount_token = float(asset1["value"])
+            token_issuer = agent1["issuer"]
+            amount_token = float(agent1["value"])
         else:
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
             return 0
@@ -402,9 +391,13 @@ def get_token_pnl():
 
         # Batch fetch DEX Screener prices
         currencies = {decode_hex_currency(token.split('-')[0]) for token in holdings}
-        batch_results = asyncio.run_coroutine_threadsafe(
-            batch_fetch_dexscreener_prices(currencies), asyncio.get_event_loop()
-        ).result()
+        batch_results = []
+        if currencies:
+            try:
+                batch_results = asyncio.run(batch_fetch_dexscreener_prices(currencies))
+            except Exception as e:
+                logger.error(f"Async batch fetch failed: {e}, using sync fallback")
+                batch_results = [get_dexscreener_price_sync(currency) for currency in currencies]
         currency_to_index = {currency: i for i, currency in enumerate(currencies)}
 
         regular_tokens = []
