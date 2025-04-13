@@ -12,13 +12,12 @@ import cachetools
 import asyncio
 import aiohttp
 import concurrent.futures
-import time
 
 app = Flask(__name__)
 CORS(app)
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # XRPL client setup
@@ -30,11 +29,11 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
 
 # Cache setup
 CACHE_TTL = 300  # 5 minutes
-price_cache = cachetools.TTLCache(maxsize=1000, ttl=CACHE_TTL)
-amm_cache = cachetools.TTLCache(maxsize=100, ttl=CACHE_TTL)
+price_cache = cachetools.TTLCache(maxsize=500, ttl=CACHE_TTL)
+amm_cache = cachetools.TTLCache(maxsize=50, ttl=CACHE_TTL)
 
-# Thread pool for XRPL requests
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+# Thread pool for XRPL requests (limited for Starter plan)
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
@@ -73,7 +72,7 @@ def decode_currency(currency, issuer, amm_info_cache=None):
     return currency, False
 
 def get_balance_changes(meta, address, relevant_tokens):
-    """Extract balance changes from transaction metadata for relevant tokens."""
+    """Extract balance changes for relevant tokens."""
     changes = {'XRP': 0}
     for node in meta.get('AffectedNodes', []):
         if 'ModifiedNode' in node:
@@ -132,7 +131,7 @@ async def fetch_dexscreener_price_async(session, decoded_currency):
     """Fetch token price from DEX Screener API asynchronously."""
     try:
         url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
-        async with session.get(url, timeout=10) as response:
+        async with session.get(url, timeout=8) as response:
             data = await response.json()
             for pair in data.get('pairs', []):
                 if (pair.get('chainId') == 'xrpl' and 
@@ -173,9 +172,8 @@ def get_dex_price(currency, issuer):
         return client.request(request).result.get("offers", [])
     
     try:
-        # Run buy and sell offer requests in parallel
-        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=10)
-        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=10)
+        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=5)
+        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=5)
         future_buy = executor.submit(fetch_offers, buy_request)
         future_sell = executor.submit(fetch_offers, sell_request)
         buy_offers = future_buy.result()
@@ -202,6 +200,7 @@ def get_dex_price(currency, issuer):
         return price
     except Exception as e:
         logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
+        price_cache[cache_key] = 0.000001
         return 0.000001
 
 def get_historical_price(decoded_currency, issuer, transactions):
@@ -249,7 +248,8 @@ def get_current_price(currency, issuer, transactions):
             price_cache[cache_key] = price
             return price
 
-    logger.warning(f"Unable to fetch price for {currency}-{issuer}, returning fallback value")
+    logger.warning(f"Unable to fetch price for {currency}-{issuer}")
+    price_cache[cache_key] = 0.000001
     return 0.000001
 
 def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
@@ -300,7 +300,7 @@ def get_token_pnl():
         return jsonify({'error': 'Wallet address is required'}), 400
 
     try:
-        # Fetch current holdings first
+        # Fetch current holdings
         req = AccountLines(account=address)
         response = client.request(req)
         lines = response.result['lines']
@@ -309,7 +309,7 @@ def get_token_pnl():
         relevant_tokens = set(holdings.keys())
         xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
 
-        # Pre-fetch AMM info for potential issuers
+        # Pre-fetch AMM info
         amm_info_cache = {}
         issuers = {token.split('-')[1] for token in holdings}
         def fetch_amm(issuer):
@@ -337,7 +337,7 @@ def get_token_pnl():
                 account=address,
                 ledger_index_min=-1,
                 ledger_index_max=-1,
-                limit=200,  # Increased limit to reduce number of requests
+                limit=400,
                 marker=marker,
                 forward=True
             )
@@ -402,6 +402,9 @@ def get_token_pnl():
             else:
                 regular_tokens.append(token_data)
 
+            # Clear buys to free memory
+            buys.clear()
+
         regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
         amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
 
@@ -414,7 +417,6 @@ def get_token_pnl():
         logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
     finally:
-        # Clean up large data structures
         transactions.clear()
 
 if __name__ == '__main__':
