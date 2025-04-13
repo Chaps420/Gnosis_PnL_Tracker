@@ -360,6 +360,8 @@ def get_token_pnl():
     if not address:
         return jsonify({'error': 'Wallet address is required'}), 400
 
+    transactions = []  # Initialize transactions to avoid UnboundLocalError
+
     try:
         # Fetch current holdings
         req = AccountLines(account=address)
@@ -414,7 +416,6 @@ def get_token_pnl():
                 amm_info_cache[issuer] = amm_info
 
         # Fetch all transactions
-        transactions = []
         marker = None
         while True:
             req = AccountTx(
