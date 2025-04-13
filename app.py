@@ -14,6 +14,9 @@ import aiohttp
 import concurrent.futures
 import time
 from decimal import Decimal
+import contextlib
+import signal
+from functools import wraps
 
 app = Flask(__name__)
 CORS(app)
@@ -36,6 +39,24 @@ amm_cache = cachetools.TTLCache(maxsize=50, ttl=CACHE_TTL)
 
 # Thread pool for XRPL requests
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+# Timeout decorator for long-running functions
+def timeout(seconds):
+    def decorator(func):
+        def _handle_timeout(signum, frame):
+            raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Set up signal handler for timeout
+            signal.signal(signal.SIGALRM, _handle_timeout)
+            signal.alarm(seconds)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                signal.alarm(0)  # Disable alarm
+        return wrapper
+    return decorator
 
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
@@ -168,8 +189,10 @@ def get_dexscreener_price_sync(decoded_currency, issuer):
     
     try:
         url = f"{DEXSCREENER_API_URL}?q={decoded_currency}+{issuer}"
-        response = requests.get(url, timeout=3).json()
-        for pair in response.get('pairs', []):
+        response = requests.get(url, timeout=3)
+        response.raise_for_status()  # Raise for 4xx/5xx errors
+        data = response.json()
+        for pair in data.get('pairs', []):
             if (pair.get('chainId') == 'xrpl' and 
                 pair.get('baseToken', {}).get('symbol') == decoded_currency and 
                 pair.get('quoteToken', {}).get('symbol') == 'XRP'):
@@ -251,7 +274,7 @@ def get_dex_price(currency, issuer):
         return None
 
 def get_historical_price(decoded_currency, issuer, transactions):
-    """Fetch price from historical transactions."""
+    """Fetch price from historical transactions within last 30 days."""
     cache_key = f"historical_{decoded_currency}_{issuer}"
     if cache_key in price_cache:
         return price_cache[cache_key]
@@ -338,22 +361,26 @@ def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
             amount_token = float(asset1["value"])
         else:
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
-            return 0
+            return None
 
         token_price = get_current_price(token_currency, token_issuer, transactions)
         if token_price is None:
             logger.warning(f"No price for LP token asset {token_currency}/{token_issuer}")
-            return 0
+            return None
         total_pool_value = amount_xrp + (amount_token * token_price)
         value_per_lp = total_pool_value / lp_tokens_issued
-        return amount_held * value_per_lp
+        current_value = amount_held * value_per_lp
+        logger.debug(f"LP token value for {issuer}: {current_value} XRP")
+        return current_value
     except Exception as e:
         logger.error(f"Error calculating LP token value for {issuer}: {e}")
-        return 0
+        return None
 
 @app.route('/token_pnl', methods=['POST'])
+@timeout(200)  # Cap at 200s to stay under gunicorn 240s timeout
 def get_token_pnl():
     """Calculate token PNL, separating AMM LP tokens, after checking for $UGA or $GNOSIS."""
+    start_time = time.time()
     data = request.json
     address = data.get('address')
 
@@ -381,6 +408,8 @@ def get_token_pnl():
             return jsonify({
                 'error': 'Unable to fetch wallet data from XRPL. Please check the address and try again later.'
             }), 400
+
+        logger.info(f"Wallet {address} holds {len(lines)} tokens")
 
         # Check for $UGA or $GNOSIS
         has_uga_or_gnosis = False
@@ -429,23 +458,32 @@ def get_token_pnl():
             if amm_info:
                 amm_info_cache[issuer] = amm_info
 
-        # Fetch all transactions
+        # Fetch transactions (limited to recent history)
         marker = None
+        tx_count = 0
+        cutoff_time = datetime.utcnow() - timedelta(days=30)
         while True:
             req = AccountTx(
                 account=address,
                 ledger_index_min=-1,
                 ledger_index_max=-1,
-                limit=400,
+                limit=200,  # Reduced batch size
                 marker=marker,
                 forward=True
             )
             response = client.request(req)
             result = response.result
-            transactions.extend(result.get('transactions', []))
+            new_txs = result.get('transactions', [])
+            for tx in new_txs:
+                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                if tx_time < cutoff_time:
+                    continue  # Skip old transactions
+                transactions.append(tx)
+            tx_count += len(new_txs)
             marker = result.get('marker')
-            if not marker:
+            if not marker or tx_count >= 2000:  # Cap total transactions
                 break
+        logger.info(f"Fetched {tx_count} transactions for {address} in {time.time() - start_time:.2f}s")
 
         # Batch fetch DEX Screener prices
         currency_issuer_pairs = [(decode_hex_currency(token.split('-')[0]), token.split('-')[1]) 
@@ -515,7 +553,10 @@ def get_token_pnl():
             }
 
             if is_amm_lp:
-                amm_lp_tokens.append(token_data)
+                if current_value is not None:
+                    amm_lp_tokens.append(token_data)
+                else:
+                    logger.warning(f"Skipping AMM LP token {currency_name}/{issuer} due to no value")
             elif current_value is not None:
                 regular_tokens.append(token_data)
             else:
@@ -526,13 +567,19 @@ def get_token_pnl():
         regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
         amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
 
+        logger.info(f"Completed PNL for {address} in {time.time() - start_time:.2f}s")
         return jsonify({
             'xrp_balance': xrp_balance,
             'tokens': regular_tokens,
             'amm_lp_tokens': amm_lp_tokens
         })
+    except TimeoutError:
+        logger.error(f"Request timeout for {address} after {time.time() - start_time:.2f}s")
+        return jsonify({
+            'error': 'Request took too long to process. Try a wallet with fewer transactions or try again later.'
+        }), 400
     except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
+        logger.error(f"Error processing request for {address}: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
     finally:
         transactions.clear()
