@@ -365,8 +365,22 @@ def get_token_pnl():
     try:
         # Fetch current holdings
         req = AccountLines(account=address)
-        response = client.request(req)
-        lines = response.result['lines']
+        try:
+            response = client.request(req)
+        except Exception as e:
+            logger.error(f"XRPL request failed for address {address}: {e}")
+            return jsonify({
+                'error': 'Unable to fetch wallet data from XRPL. Please check the address and try again later.'
+            }), 400
+
+        # Check response for 'result' key
+        try:
+            lines = response.result['lines']
+        except (KeyError, AttributeError) as e:
+            logger.error(f"Invalid XRPL response for address {address}: {e}")
+            return jsonify({
+                'error': 'Unable to fetch wallet data from XRPL. Please check the address and try again later.'
+            }), 400
 
         # Check for $UGA or $GNOSIS
         has_uga_or_gnosis = False
