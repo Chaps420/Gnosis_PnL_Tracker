@@ -353,7 +353,7 @@ def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
 
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
-    """Calculate token PNL, separating AMM LP tokens."""
+    """Calculate token PNL, separating AMM LP tokens, after checking for $UGA or $GNOSIS."""
     data = request.json
     address = data.get('address')
 
@@ -365,6 +365,29 @@ def get_token_pnl():
         req = AccountLines(account=address)
         response = client.request(req)
         lines = response.result['lines']
+
+        # Check for $UGA or $GNOSIS
+        has_uga_or_gnosis = False
+        uga_key = "UGA-rBFJGmWj6YaabVCxfsjiCM8pfYXs8xFdeC"
+        gnosis_key = "474E4F5349530000000000000000000000000000-rHUQ3xYC2hwfJa9idjjmsCcb5hP3qZiiTM"
+        for line in lines:
+            token_key = f"{line['currency']}-{line['account']}"
+            if token_key in (uga_key, gnosis_key) and float(line['balance']) > 0:
+                has_uga_or_gnosis = True
+                logger.info(f"Found {'$UGA' if token_key == uga_key else '$GNOSIS'} in wallet {address}")
+                break
+
+        if not has_uga_or_gnosis:
+            logger.info(f"No $UGA or $GNOSIS found in wallet {address}")
+            return jsonify({
+                'error': 'This wallet does not contain $UGA or $GNOSIS - Go to the following to purchase -',
+                'purchase_links': [
+                    'https://firstledger.net/token/rHUQ3xYC2hwfJa9idjjmsCcb5hP3qZiiTM/474E4F5349530000000000000000000000000000',
+                    'https://firstledger.net/token/rBFJGmWj6YaabVCxfsjiCM8pfYXs8xFdeC/UGA'
+                ]
+            }), 400
+
+        # Proceed with PNL calculation
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
                     for line in lines if float(line['balance']) > 0.0001}
         relevant_tokens = set(holdings.keys())
