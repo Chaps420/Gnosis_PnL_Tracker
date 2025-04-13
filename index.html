@@ -93,6 +93,18 @@
       color: #ff4c4c;
       font-weight: bold;
     }
+    .error-container {
+      text-align: center;
+    }
+    .error-container p {
+      margin-bottom: 15px;
+    }
+    .error-container button {
+      width: auto;
+      padding: 8px 16px;
+      margin: 5px;
+      display: inline-block;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -329,7 +341,18 @@
 
           resultsDiv.innerHTML = output;
         } else {
-          resultsDiv.innerHTML = `<span class="error">Error: ${data.error}</span>`;
+          // Handle error with purchase links
+          let errorOutput = `<div class="error-container"><p class="error">${data.error}</p>`;
+          if (data.purchase_links && data.purchase_links.length) {
+            errorOutput += '<div>';
+            data.purchase_links.forEach((link, index) => {
+              const tokenName = index === 0 ? '$GNOSIS' : '$UGA';
+              errorOutput += `<button onclick="window.open('${link}', '_blank')">Buy ${tokenName}</button>`;
+            });
+            errorOutput += '</div>';
+          }
+          errorOutput += '</div>';
+          resultsDiv.innerHTML = errorOutput;
         }
       } catch (error) {
         console.error('Error in calculateTokenPNL:', error);
