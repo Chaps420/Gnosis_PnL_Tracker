@@ -5,4 +5,3 @@ requests
 cachetools
 aiohttp
 gunicorn
-python-decimal
