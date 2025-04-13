@@ -1,5 +1,6 @@
 flask
 flask-cors
-xrpl-py>=1.9.1
+xrpl-py
 requests
-gunicorn
+cachetools
+aiohttp
