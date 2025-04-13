@@ -4,3 +4,4 @@ xrpl-py
 requests
 cachetools
 aiohttp
+gunicorn
