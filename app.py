@@ -12,6 +12,7 @@ import cachetools
 import asyncio
 import aiohttp
 import concurrent.futures
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -32,7 +33,7 @@ CACHE_TTL = 300  # 5 minutes
 price_cache = cachetools.TTLCache(maxsize=500, ttl=CACHE_TTL)
 amm_cache = cachetools.TTLCache(maxsize=50, ttl=CACHE_TTL)
 
-# Thread pool for XRPL requests (limited for Starter plan)
+# Thread pool for XRPL requests
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 def decode_hex_currency(hex_code):
@@ -129,38 +130,82 @@ def get_balance_changes(meta, address, relevant_tokens):
 
 async def fetch_dexscreener_price_async(session, decoded_currency):
     """Fetch token price from DEX Screener API asynchronously."""
+    start_time = time.time()
     try:
         url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
-        async with session.get(url, timeout=8) as response:
+        async with session.get(url, timeout=3) as response:
             data = await response.json()
             for pair in data.get('pairs', []):
                 if (pair.get('chainId') == 'xrpl' and 
                     pair.get('baseToken', {}).get('symbol') == decoded_currency and 
                     pair.get('quoteToken', {}).get('symbol') == 'XRP'):
-                    return float(pair.get('priceNative', '0'))
+                    price = float(pair.get('priceNative', '0'))
+                    logger.debug(f"DEX Screener fetched {decoded_currency}: {price} in {time.time() - start_time:.2f}s")
+                    return price
+        logger.debug(f"DEX Screener no price for {decoded_currency} in {time.time() - start_time:.2f}s")
         return None
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(f"DEX Screener async error for {decoded_currency}: {e}")
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.error(f"DEX Screener async error for {decoded_currency}: {e} in {time.time() - start_time:.2f}s")
         return None
 
-def get_dexscreener_price(decoded_currency):
-    """Synchronous wrapper for async DEX Screener price fetch."""
+async def batch_fetch_dexscreener_prices(currencies):
+    """Fetch DEX Screener prices for multiple currencies in parallel."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            tasks = [fetch_dexscreener_price_async(session, currency) for currency in currencies]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logger.error(f"Batch DEX Screener error: {e}")
+        return [None] * len(currencies)
+
+def get_dexscreener_price_sync(decoded_currency):
+    """Synchronous DEX Screener fallback using requests."""
     cache_key = f"dexscreener_{decoded_currency}"
     if cache_key in price_cache:
         return price_cache[cache_key]
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    try:
+        url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
+        response = requests.get(url, timeout=3).json()
+        for pair in response.get('pairs', []):
+            if (pair.get('chainId') == 'xrpl' and 
+                pair.get('baseToken', {}).get('symbol') == decoded_currency and 
+                pair.get('quoteToken', {}).get('symbol') == 'XRP'):
+                price = float(pair.get('priceNative', '0'))
+                price_cache[cache_key] = price
+                return price
+        price_cache[cache_key] = None
+        return None
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"DEX Screener sync error for {decoded_currency}: {e}")
+        price_cache[cache_key] = None
+        return None
+
+def get_dexscreener_price(decoded_currency, batch_results=None, batch_index=None):
+    """Get DEX Screener price, using batch results or sync fallback."""
+    cache_key = f"dexscreener_{decoded_currency}"
+    if cache_key in price_cache:
+        return price_cache[cache_key]
+    
+    if batch_results and batch_index is not None:
+        price = batch_results[batch_index]
+        if isinstance(price, Exception):
+            price = None
+        price_cache[cache_key] = price
+        return price
+    
+    # Try async fetch
     try:
         async def fetch():
             async with aiohttp.ClientSession() as session:
                 return await fetch_dexscreener_price_async(session, decoded_currency)
-        price = loop.run_until_complete(fetch())
-        if price is not None:
-            price_cache[cache_key] = price
+        price = asyncio.run_coroutine_threadsafe(fetch(), asyncio.get_event_loop()).result()
+        price_cache[cache_key] = price
         return price
-    finally:
-        loop.close()
+    except Exception as e:
+        logger.error(f"DEX Screener async failed for {decoded_currency}: {e}, falling back to sync")
+        # Fallback to sync
+        return get_dexscreener_price_sync(decoded_currency)
 
 def get_dex_price(currency, issuer):
     """Fetch price from XRPL DEX."""
@@ -169,11 +214,14 @@ def get_dex_price(currency, issuer):
         return price_cache[cache_key]
     
     def fetch_offers(request):
-        return client.request(request).result.get("offers", [])
+        try:
+            return client.request(request).result.get("offers", [])
+        except Exception:
+            return []
     
     try:
-        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=5)
-        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=5)
+        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=3)
+        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=3)
         future_buy = executor.submit(fetch_offers, buy_request)
         future_sell = executor.submit(fetch_offers, sell_request)
         buy_offers = future_buy.result()
@@ -231,7 +279,7 @@ def get_historical_price(decoded_currency, issuer, transactions):
         price_cache[cache_key] = price
     return price
 
-def get_current_price(currency, issuer, transactions):
+def get_current_price(currency, issuer, transactions, batch_results=None, batch_index=None):
     """Fetch current token price in XRP with fallbacks."""
     cache_key = f"current_{currency}_{issuer}"
     if cache_key in price_cache:
@@ -239,14 +287,18 @@ def get_current_price(currency, issuer, transactions):
     
     decoded_currency = decode_hex_currency(currency)
     for method in (
-        lambda: get_dexscreener_price(decoded_currency),
+        lambda: get_dexscreener_price(decoded_currency, batch_results, batch_index),
         lambda: get_dex_price(currency, issuer),
         lambda: get_historical_price(decoded_currency, issuer, transactions)
     ):
-        price = method()
-        if price and price > 0.000001:
-            price_cache[cache_key] = price
-            return price
+        try:
+            price = method()
+            if price and price > 0.000001:
+                price_cache[cache_key] = price
+                return price
+        except Exception as e:
+            logger.error(f"Price method failed for {currency}-{issuer}: {e}")
+            continue
 
     logger.warning(f"Unable to fetch price for {currency}-{issuer}")
     price_cache[cache_key] = 0.000001
@@ -348,6 +400,13 @@ def get_token_pnl():
             if not marker:
                 break
 
+        # Batch fetch DEX Screener prices
+        currencies = {decode_hex_currency(token.split('-')[0]) for token in holdings}
+        batch_results = asyncio.run_coroutine_threadsafe(
+            batch_fetch_dexscreener_prices(currencies), asyncio.get_event_loop()
+        ).result()
+        currency_to_index = {currency: i for i, currency in enumerate(currencies)}
+
         regular_tokens = []
         amm_lp_tokens = []
         for token, amount_held in holdings.items():
@@ -381,8 +440,9 @@ def get_token_pnl():
                                     sell_amount = 0
 
             cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
+            batch_index = currency_to_index.get(decode_hex_currency(currency))
             current_value = (get_lp_token_value(issuer, amount_held, transactions, amm_info_cache) if is_amm_lp 
-                            else amount_held * get_current_price(currency, issuer, transactions))
+                            else amount_held * get_current_price(currency, issuer, transactions, batch_results, batch_index))
             unrealized_pnl = current_value - cost_basis
             total_pnl = realized_pnl + unrealized_pnl
 
@@ -402,7 +462,6 @@ def get_token_pnl():
             else:
                 regular_tokens.append(token_data)
 
-            # Clear buys to free memory
             buys.clear()
 
         regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
