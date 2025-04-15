@@ -218,7 +218,7 @@
     <input type="text" id="walletAddress" placeholder="r..." aria-label="XRPL Wallet Address" />
     <button onclick="calculateTokenPNL()">Calculate Token PNL</button>
   </div>
-  <div id="results" class="loading">Enter an address and click "Calculate Token PNL"</div>
+  <div id="results">Enter an address and click "Calculate Token PNL"</div>
   
   <div class="ads-container">
     <div class="ad-row">
@@ -269,8 +269,8 @@
         return;
       }
 
-      resultsDiv.innerHTML = '<span>Loading token PNL...</span>';
       resultsDiv.classList.add('loading');
+      resultsDiv.innerHTML = '<span>Loading token PNL...</span>';
 
       try {
         const response = await fetch(API_ENDPOINT, {
