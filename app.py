@@ -41,7 +41,7 @@ amm_cache = cachetools.TTLCache(maxsize=50, ttl=CACHE_TTL)
 # Thread pool for XRPL requests
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-# Database connection with corrected hostname
+# Database connection
 conn = psycopg2.connect("postgresql://xrpl_db_user:rxJrwtYv8E0vybNI5UfBPwh6J0vKOneL@dpg-cvu7p4buibrs73eji4dg-a.oregon-postgres.render.com/xrpl_db")
 
 # Timeout decorator
@@ -98,9 +98,10 @@ def decode_currency(currency, issuer, amm_info_cache=None):
     return currency, False
 
 def get_balance_changes(meta, address, relevant_tokens):
-    """Extract balance changes for relevant tokens."""
+    """Extract balance changes for relevant tokens, including AMM and OfferCreate."""
     changes = {'XRP': 0}
     for node in meta.get('AffectedNodes', []):
+        # Handle AccountRoot for XRP balance changes
         if 'ModifiedNode' in node:
             modified = node['ModifiedNode']
             if modified.get('LedgerEntryType') == 'AccountRoot' and 'PreviousFields' in modified:
@@ -110,6 +111,7 @@ def get_balance_changes(meta, address, relevant_tokens):
                     final_balance = int(final_fields.get('Balance', 0))
                     previous_balance = int(previous_fields['Balance'])
                     changes['XRP'] += final_balance - previous_balance
+            # Handle RippleState for token balance changes
             elif modified.get('LedgerEntryType') == 'RippleState' and 'PreviousFields' in modified:
                 final_fields = modified.get('FinalFields', {})
                 previous_fields = modified.get('PreviousFields', {})
@@ -125,6 +127,7 @@ def get_balance_changes(meta, address, relevant_tokens):
                             previous_balance = float(previous_fields['Balance']['value'])
                             delta = final_balance - previous_balance
                             changes[token_key] = changes.get(token_key, 0) + (delta if low == address else -delta)
+        # Handle CreatedNode for new trust lines
         elif 'CreatedNode' in node:
             created = node['CreatedNode']
             if created.get('LedgerEntryType') == 'RippleState':
@@ -138,6 +141,7 @@ def get_balance_changes(meta, address, relevant_tokens):
                     if token_key in relevant_tokens:
                         balance = float(new_fields.get('Balance', {}).get('value', 0))
                         changes[token_key] = changes.get(token_key, 0) + (balance if low == address else -balance)
+        # Handle DeletedNode for closed trust lines
         elif 'DeletedNode' in node:
             deleted = node['DeletedNode']
             if deleted.get('LedgerEntryType') == 'RippleState':
@@ -151,6 +155,18 @@ def get_balance_changes(meta, address, relevant_tokens):
                     if token_key in relevant_tokens:
                         balance = float(final_fields.get('Balance', {}).get('value', 0))
                         changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
+    # Handle OfferCreate and AMM trades via delivered_amount
+    if isinstance(meta.get('delivered_amount'), dict):
+        delivered = meta['delivered_amount']
+        if delivered.get('currency') != 'XRP':
+            currency = delivered['currency']
+            issuer = delivered.get('issuer')
+            token_key = f"{currency}-{issuer}"
+            if token_key in relevant_tokens and meta.get('TransactionResult') == 'tesSUCCESS':
+                amount = float(delivered['value'])
+                if amount > 0:
+                    changes[token_key] = changes.get(token_key, 0) + amount
+                    logger.debug(f"Detected token buy {token_key}: {amount}")
     return changes
 
 async def fetch_dexscreener_batch_async(session, token_ids, semaphore):
@@ -408,17 +424,13 @@ def get_token_pnl():
                 except Exception:
                     pass
 
-        # Check database for last transaction date
+        # Fetch and store new transactions
         with conn.cursor() as cur:
             cur.execute("SELECT MAX(tx_date) FROM transactions WHERE wallet_address = %s", (address,))
             last_tx_date = cur.fetchone()[0] or datetime(2024, 9, 1)
 
-        # Fetch new transactions
         marker = None
         tx_count = 0
-        token_buy_queues = defaultdict(deque)
-        token_realized_pnl = defaultdict(float)
-
         while True:
             req = AccountTx(account=address, limit=1000, marker=marker, forward=True)
             response = client.request(req)
@@ -435,28 +447,6 @@ def get_token_pnl():
                         (address, tx['tx']['hash'], Json(tx), tx_time)
                     )
                     tx_count += 1
-                    meta = tx.get('meta', {})
-                    if isinstance(meta, dict):
-                        changes = get_balance_changes(meta, address, relevant_tokens)
-                        delta_xrp = changes.get('XRP', 0) / 1_000_000
-                        for token in relevant_tokens:
-                            delta_token = changes.get(token, 0)
-                            if delta_xrp < 0 and delta_token > 0:  # Buy
-                                price = -delta_xrp / delta_token
-                                token_buy_queues[token].append({'amount': delta_token, 'price': price})
-                            elif delta_xrp > 0 and delta_token < 0:  # Sell
-                                sell_amount = -delta_token
-                                sell_value = delta_xrp
-                                while sell_amount > 0 and token_buy_queues[token]:
-                                    buy = token_buy_queues[token][0]
-                                    if buy['amount'] <= sell_amount:
-                                        token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * buy['amount']
-                                        sell_amount -= buy['amount']
-                                        token_buy_queues[token].popleft()
-                                    else:
-                                        token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * sell_amount
-                                        buy['amount'] -= sell_amount
-                                        sell_amount = 0
                 conn.commit()
 
             marker = result.get('marker')
@@ -468,10 +458,39 @@ def get_token_pnl():
 
         logger.info(f"Fetched {tx_count} new transactions for {address} since {last_tx_date}")
 
-        # Fetch all transactions for PNL
+        # Fetch all transactions for PNL calculation
         with conn.cursor() as cur:
             cur.execute("SELECT tx_data FROM transactions WHERE wallet_address = %s AND tx_date >= %s ORDER BY tx_date", (address, datetime(2024, 9, 1)))
             all_txs = [row[0] for row in cur.fetchall()]
+
+        # Calculate PNL from all transactions
+        token_buy_queues = defaultdict(deque)
+        token_realized_pnl = defaultdict(float)
+        for tx in all_txs:
+            meta = tx.get('meta', {})
+            if isinstance(meta, dict):
+                changes = get_balance_changes(meta, address, relevant_tokens)
+                delta_xrp = changes.get('XRP', 0) / 1_000_000
+                for token in relevant_tokens:
+                    delta_token = changes.get(token, 0)
+                    if delta_xrp < 0 and delta_token > 0:  # Buy
+                        price = -delta_xrp / delta_token
+                        token_buy_queues[token].append({'amount': delta_token, 'price': price})
+                        logger.debug(f"Buy {token}: {delta_token} tokens at {price} XRP/token")
+                    elif delta_xrp > 0 and delta_token < 0:  # Sell
+                        sell_amount = -delta_token
+                        sell_value = delta_xrp
+                        logger.debug(f"Sell {token}: {sell_amount} tokens for {sell_value} XRP")
+                        while sell_amount > 0 and token_buy_queues[token]:
+                            buy = token_buy_queues[token][0]
+                            if buy['amount'] <= sell_amount:
+                                token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * buy['amount']
+                                sell_amount -= buy['amount']
+                                token_buy_queues[token].popleft()
+                            else:
+                                token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * sell_amount
+                                buy['amount'] -= sell_amount
+                                sell_amount = 0
 
         # Batch fetch DEX Screener prices
         currency_issuer_pairs = [(decode_hex_currency(token.split('-')[0]), token.split('-')[1]) for token in holdings]
