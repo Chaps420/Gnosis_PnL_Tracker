@@ -41,8 +41,8 @@ amm_cache = cachetools.TTLCache(maxsize=50, ttl=CACHE_TTL)
 # Thread pool for XRPL requests
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-# Database connection with your provided URL
-conn = psycopg2.connect("postgresql://xrpl_db_user:rxJrwtYv8E0vybNI5UfBPwh6J0vKOneL@dpg-cvu7p4buibrs73eji4dg-a/xrpl_db")
+# Database connection with corrected hostname
+conn = psycopg2.connect("postgresql://xrpl_db_user:rxJrwtYv8E0vybNI5UfBPwh6J0vKOneL@dpg-cvu7p4buibrs73eji4dg-a.oregon-postgres.render.com/xrpl_db")
 
 # Timeout decorator
 def timeout(seconds):
@@ -350,7 +350,7 @@ def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
         elif isinstance(asset2, str):
             amount_xrp = float(asset2) / 1_000_000
             token_currency = asset1["currency"]
-            token_issuer = api_key = os.getenv("OPENAI_API_KEY")1["issuer"]
+            token_issuer = asset1["issuer"]
             amount_token = float(asset1["value"])
         else:
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
