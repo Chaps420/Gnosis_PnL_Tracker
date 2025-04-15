@@ -101,7 +101,6 @@ def get_balance_changes(meta, address, relevant_tokens):
     """Extract balance changes for relevant tokens, including AMM and OfferCreate."""
     changes = {'XRP': 0}
     for node in meta.get('AffectedNodes', []):
-        # Handle AccountRoot for XRP balance changes
         if 'ModifiedNode' in node:
             modified = node['ModifiedNode']
             if modified.get('LedgerEntryType') == 'AccountRoot' and 'PreviousFields' in modified:
@@ -111,7 +110,6 @@ def get_balance_changes(meta, address, relevant_tokens):
                     final_balance = int(final_fields.get('Balance', 0))
                     previous_balance = int(previous_fields['Balance'])
                     changes['XRP'] += final_balance - previous_balance
-            # Handle RippleState for token balance changes
             elif modified.get('LedgerEntryType') == 'RippleState' and 'PreviousFields' in modified:
                 final_fields = modified.get('FinalFields', {})
                 previous_fields = modified.get('PreviousFields', {})
@@ -127,7 +125,6 @@ def get_balance_changes(meta, address, relevant_tokens):
                             previous_balance = float(previous_fields['Balance']['value'])
                             delta = final_balance - previous_balance
                             changes[token_key] = changes.get(token_key, 0) + (delta if low == address else -delta)
-        # Handle CreatedNode for new trust lines
         elif 'CreatedNode' in node:
             created = node['CreatedNode']
             if created.get('LedgerEntryType') == 'RippleState':
@@ -141,7 +138,6 @@ def get_balance_changes(meta, address, relevant_tokens):
                     if token_key in relevant_tokens:
                         balance = float(new_fields.get('Balance', {}).get('value', 0))
                         changes[token_key] = changes.get(token_key, 0) + (balance if low == address else -balance)
-        # Handle DeletedNode for closed trust lines
         elif 'DeletedNode' in node:
             deleted = node['DeletedNode']
             if deleted.get('LedgerEntryType') == 'RippleState':
@@ -155,7 +151,6 @@ def get_balance_changes(meta, address, relevant_tokens):
                     if token_key in relevant_tokens:
                         balance = float(final_fields.get('Balance', {}).get('value', 0))
                         changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
-    # Handle OfferCreate and AMM trades via delivered_amount
     if isinstance(meta.get('delivered_amount'), dict):
         delivered = meta['delivered_amount']
         if delivered.get('currency') != 'XRP':
@@ -168,6 +163,128 @@ def get_balance_changes(meta, address, relevant_tokens):
                     changes[token_key] = changes.get(token_key, 0) + amount
                     logger.debug(f"Detected token buy {token_key}: {amount}")
     return changes
+
+async def batch_fetch_dexscreener_prices(currency_issuer_pairs):
+    """Batch fetch prices from DEX Screener for given currency-issuer pairs."""
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for currency, issuer in currency_issuer_pairs:
+            cache_key = f"{currency}-{issuer}"
+            if cache_key in price_cache:
+                tasks.append(asyncio.ensure_future(asyncio.sleep(0, result=price_cache[cache_key])))
+            else:
+                tasks.append(asyncio.ensure_future(fetch_dexscreener_price(session, currency, issuer)))
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+async def fetch_dexscreener_price(session, currency, issuer):
+    """Fetch price for a single currency-issuer pair from DEX Screener."""
+    cache_key = f"{currency}-{issuer}"
+    try:
+        params = {'q': f"{currency}/{issuer}"}
+        async with session.get(DEXSCREENER_API_URL, params=params) as response:
+            if response.status == 200:
+                data = await response.json()
+                pairs = data.get('pairs', [])
+                if pairs:
+                    price = float(pairs[0].get('priceUsd', 0))
+                    if price > 0:
+                        price_cache[cache_key] = price
+                        return price
+                logger.debug(f"No price found for {currency}/{issuer}")
+                return None
+            else:
+                logger.debug(f"DEX Screener API error for {currency}/{issuer}: {response.status}")
+                return None
+    except Exception as e:
+        logger.debug(f"Error fetching price for {currency}/{issuer}: {e}")
+        return None
+
+def get_current_price(currency, issuer, all_txs, batch_results, batch_index):
+    """Get the current price for a token, preferring DEX Screener, then AMM, then transaction history."""
+    cache_key = f"{currency}-{issuer}"
+    if cache_key in price_cache:
+        return price_cache[cache_key]
+
+    # Try DEX Screener batch result
+    price = batch_results[batch_index]
+    if isinstance(price, float) and price > 0:
+        price_cache[cache_key] = price
+        return price
+
+    # Fallback to AMM BookOffers
+    try:
+        book = client.request(BookOffers(
+            taker_gets={"currency": currency, "issuer": issuer},
+            taker_pays={"currency": "XRP"}
+        )).result
+        offers = book.get('offers', [])
+        if offers:
+            total_xrp = sum(float(offer['taker_pays']) for offer in offers)
+            total_tokens = sum(float(offer['taker_gets']['value']) for offer in offers)
+            if total_tokens > 0:
+                price = total_xrp / total_tokens
+                price_cache[cache_key] = price
+                return price
+    except Exception as e:
+        logger.debug(f"BookOffers failed for {currency}/{issuer}: {e}")
+
+    # Fallback to recent transactions
+    for tx in reversed(all_txs):
+        meta = tx.get('meta', {})
+        if isinstance(meta, dict):
+            changes = get_balance_changes(meta, tx['tx']['Account'], {f"{currency}-{issuer}"})
+            delta_xrp = changes.get('XRP', 0) / 1_000_000
+            delta_token = changes.get(f"{currency}-{issuer}", 0)
+            if delta_xrp < 0 and delta_token > 0:
+                price = -delta_xrp / delta_token
+                if price > 0:
+                    price_cache[cache_key] = price
+                    return price
+
+    logger.warning(f"No price found for {currency}/{issuer}")
+    return None
+
+def get_lp_token_value(issuer, amount_held, all_txs, amm_info_cache):
+    """Calculate the value of LP tokens based on the AMM pool's underlying assets."""
+    try:
+        if issuer not in amm_info_cache:
+            return None
+        amm_info = amm_info_cache[issuer]
+        lp_token = amm_info.get('lp_token', {})
+        total_lp_supply = float(lp_token.get('value', 0)) if isinstance(lp_token, dict) else 0
+        if total_lp_supply <= 0 or amount_held <= 0:
+            return 0
+
+        asset1 = amm_info['amount']
+        asset2 = amm_info['amount2']
+        asset1_value = 0
+        asset2_value = 0
+
+        if isinstance(asset1, str):  # XRP
+            asset1_value = float(asset1) / 1_000_000  # Convert drops to XRP
+        else:
+            currency = asset1['currency']
+            issuer1 = asset1['issuer']
+            price = get_current_price(currency, issuer1, all_txs, [], 0)
+            if price:
+                asset1_value = float(asset1['value']) * price
+
+        if isinstance(asset2, str):  # XRP
+            asset2_value = float(asset2) / 1_000_000
+        else:
+            currency = asset2['currency']
+            issuer2 = asset2['issuer']
+            price = get_current_price(currency, issuer2, all_txs, [], 0)
+            if price:
+                asset2_value = float(asset2['value']) * price
+
+        total_pool_value = asset1_value + asset2_value
+        share = amount_held / total_lp_supply
+        lp_value = total_pool_value * share
+        return lp_value if lp_value > 0 else 0
+    except Exception as e:
+        logger.error(f"Error calculating LP token value for {issuer}: {e}")
+        return 0
 
 @app.route('/token_pnl', methods=['POST'])
 @timeout(240)
@@ -188,7 +305,10 @@ def get_token_pnl():
         relevant_tokens = set(holdings.keys())
 
         # Check for $UGA or $GNOSIS
-        has_uga_or_gnosis = any(token in holdings for token in ["UGA-rBFJGmWj6YaabVCxfsjiCM8pfYXs8xFdeC", "474E4F5349530000000000000000000000000000-rHUQ3xYC2hwfJa9idjjmsCcb5hP3qZiiTM"])
+        has_uga_or_gnosis = any(token in holdings for token in [
+            "UGA-rBFJGmWj6YaabVCxfsjiCM8pfYXs8xFdeC",
+            "474E4F5349530000000000000000000000000000-rHUQ3xYC2hwfJa9idjjmsCcb5hP3qZiiTM"
+        ])
         if not has_uga_or_gnosis:
             return jsonify({
                 'error': 'This wallet does not contain $UGA or $GNOSIS - Go to the following to purchase -',
@@ -258,24 +378,29 @@ def get_token_pnl():
                 delta_xrp = changes.get('XRP', 0) / 1_000_000
                 for token in relevant_tokens:
                     delta_token = changes.get(token, 0)
-                    if delta_xrp < 0 and delta_token > 0:  # Buy
+                    if delta_xrp < 0 and delta_token > 0 and delta_token != 0:  # Buy
                         price = -delta_xrp / delta_token
-                        token_buy_queues[token].append({'amount': delta_token, 'price': price})
-                        logger.debug(f"Buy {token}: {delta_token} tokens at {price} XRP/token")
+                        if price > 0:  # Ensure valid price
+                            token_buy_queues[token].append({'amount': delta_token, 'price': price})
+                            logger.debug(f"Buy {token}: {delta_token} tokens at {price} XRP/token")
                     elif delta_xrp > 0 and delta_token < 0:  # Sell
                         sell_amount = -delta_token
                         sell_value = delta_xrp
-                        logger.debug(f"Sell {token}: {sell_amount} tokens for {sell_value} XRP")
-                        while sell_amount > 0 and token_buy_queues[token]:
-                            buy = token_buy_queues[token][0]
-                            if buy['amount'] <= sell_amount:
-                                token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * buy['amount']
-                                sell_amount -= buy['amount']
-                                token_buy_queues[token].popleft()
-                            else:
-                                token_realized_pnl[token] += (sell_value / sell_amount - buy['price']) * sell_amount
-                                buy['amount'] -= sell_amount
-                                sell_amount = 0
+                        if sell_amount > 0 and sell_value > 0:
+                            sell_price = sell_value / sell_amount
+                            logger.debug(f"Sell {token}: {sell_amount} tokens for {sell_value} XRP")
+                            while sell_amount > 0 and token_buy_queues[token]:
+                                buy = token_buy_queues[token][0]
+                                if buy['amount'] <= sell_amount:
+                                    profit = (sell_price - buy['price']) * buy['amount']
+                                    token_realized_pnl[token] += profit
+                                    sell_amount -= buy['amount']
+                                    token_buy_queues[token].popleft()
+                                else:
+                                    profit = (sell_price - buy['price']) * sell_amount
+                                    token_realized_pnl[token] += profit
+                                    buy['amount'] -= sell_amount
+                                    sell_amount = 0
 
         # Batch fetch DEX Screener prices
         currency_issuer_pairs = [(decode_hex_currency(token.split('-')[0]), token.split('-')[1]) for token in holdings]
@@ -290,16 +415,20 @@ def get_token_pnl():
             realized_pnl = token_realized_pnl[token]
             buy_count = len(buys)
 
-            cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
+            # Calculate cost basis as total XRP spent on remaining tokens
+            cost_basis = sum(buy['amount'] * buy['price'] for buy in buys) if buys else 0
             logger.info(f"Token {currency_name}/{issuer}: buys={buy_count}, cost_basis={cost_basis}, realized_pnl={realized_pnl}")
-            batch_index = i
-            current_price = get_current_price(currency, issuer, all_txs, batch_results, batch_index)
+
+            # Get current price and value
+            current_price = get_current_price(currency, issuer, all_txs, batch_results, i)
             current_value = None
             if is_amm_lp:
                 current_value = get_lp_token_value(issuer, holdings[token], all_txs, amm_info_cache)
-            elif current_price is not None:
+            elif current_price is not None and holdings[token] > 0:
                 current_value = float(Decimal(str(holdings[token])) * Decimal(str(current_price)))
-            unrealized_pnl = current_value - cost_basis if current_value is not None else 0
+
+            # Calculate PNL metrics
+            unrealized_pnl = (current_value - cost_basis) if current_value is not None and cost_basis is not None else 0
             total_pnl = realized_pnl + unrealized_pnl
 
             token_data = {
@@ -318,11 +447,19 @@ def get_token_pnl():
             else:
                 regular_tokens.append(token_data)
 
-        regular_tokens.sort(key=lambda x: x['current_value'], reverse=True)
-        amm_lp_tokens.sort(key=lambda x: x['current_value'], reverse=True)
+        regular_tokens.sort(key=lambda x: x['current_value'] or 0, reverse=True)
+        amm_lp_tokens.sort(key=lambda x: x['current_value'] or 0, reverse=True)
+
+        # Calculate XRP balance
+        xrp_balance = 0
+        try:
+            account_info = client.request(xrpl.models.requests.AccountInfo(account=address)).result
+            xrp_balance = float(Decimal(account_info['account_data']['Balance']) / 1_000_000)
+        except Exception as e:
+            logger.warning(f"Failed to fetch XRP balance for {address}: {e}")
 
         return jsonify({
-            'xrp_balance': sum(float(line['balance']) for line in lines if line['currency'] == 'XRP'),
+            'xrp_balance': xrp_balance,
             'tokens': regular_tokens,
             'amm_lp_tokens': amm_lp_tokens
         })
