@@ -88,6 +88,23 @@
       font-style: italic;
       color: #FFD700;
       text-align: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .loading::before {
+      content: '';
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid #FFD700;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 10px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
     .error {
       color: #ff4c4c;
@@ -246,7 +263,13 @@
         return;
       }
 
-      resultsDiv.innerHTML = 'Loading token PNL...';
+      // Validate XRPL address format
+      if (!address.match(/^r[0-9a-zA-Z]{24,34}$/)) {
+        resultsDiv.innerHTML = '<span class="error">Invalid XRPL address format (must start with "r" and be 25-35 characters)</span>';
+        return;
+      }
+
+      resultsDiv.innerHTML = '<span>Loading token PNL...</span>';
       resultsDiv.classList.add('loading');
 
       try {
@@ -349,6 +372,9 @@
               const tokenName = index === 0 ? '$GNOSIS' : '$UGA';
               errorOutput += `<button onclick="window.open('${link}', '_blank')">Buy ${tokenName}</button>`;
             });
+            if (data.error.includes('Partial data saved')) {
+              errorOutput += `<button onclick="calculateTokenPNL()">Retry</button>`;
+            }
             errorOutput += '</div>';
           }
           errorOutput += '</div>';
