@@ -26,7 +26,7 @@ app = Flask(__name__)
 CORS(app)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # XRPL client setup
@@ -62,7 +62,6 @@ def timeout(seconds):
             raise TimeoutError(f"Function {func.__name__} timed out after {seconds} seconds")
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # Timeout not supported on Windows; skip for local testing
             if os.name == 'nt':
                 return func(*args, **kwargs)
             signal.signal(signal.SIGALRM, _handle_timeout)
@@ -160,10 +159,10 @@ def get_balance_changes(meta, address, relevant_tokens, tx):
                     if token_key in relevant_tokens:
                         balance = float(final_fields.get('Balance', {}).get('value', 0))
                         changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
-    # Adjust XRP delta for fees if the account initiated the transaction
     if tx['tx']['Account'] == address and 'Fee' in tx['tx']:
         fee = int(tx['tx']['Fee']) / 1_000_000
         changes['XRP'] += fee
+    logger.debug(f"Balance changes for {address} in tx {tx['tx']['hash']}: {changes}")
     return changes
 
 async def fetch_dexscreener_batch_async(session, token_ids, semaphore):
@@ -180,6 +179,7 @@ async def fetch_dexscreener_batch_async(session, token_ids, semaphore):
                         issuer = pair.get('baseToken', {}).get('address')
                         price = float(pair.get('priceNative', '0'))
                         prices[f"{base_token}-{issuer}"] = price
+                        logger.debug(f"DEX Screener fetched price for {base_token}-{issuer}: {price}")
                 logger.debug(f"DEX Screener batch fetched {len(prices)} prices in {time.time() - start_time:.2f}s")
                 return prices
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
@@ -204,16 +204,22 @@ async def batch_fetch_dexscreener_prices(currency_issuer_pairs):
 def get_dexscreener_price_sync(decoded_currency, issuer):
     cache_key = f"dexscreener_{decoded_currency}_{issuer}"
     if cache_key in price_cache:
+        logger.debug(f"Using cached DEX Screener price for {decoded_currency}-{issuer}: {price_cache[cache_key]}")
         return price_cache[cache_key]
     try:
         url = f"{DEXSCREENER_API_URL}?q={decoded_currency}.{issuer}"
         response = requests.get(url, timeout=3).json()
         for pair in response.get('pairs', []):
-            if pair.get('chainId') == 'xrpl' and pair.get('baseToken', {}).get('symbol') == decoded_currency and pair.get('quoteToken', {}).get('symbol') == 'XRP':
+            if (pair.get('chainId') == 'xrpl' and 
+                pair.get('baseToken', {}).get('symbol').upper() == decoded_currency.upper() and 
+                pair.get('baseToken', {}).get('address') == issuer and
+                pair.get('quoteToken', {}).get('symbol') == 'XRP'):
                 price = float(pair.get('priceNative', '0'))
                 price_cache[cache_key] = price
+                logger.debug(f"DEX Screener sync fetched price for {decoded_currency}-{issuer}: {price}")
                 return price
         price_cache[cache_key] = None
+        logger.debug(f"No DEX Screener price found for {decoded_currency}-{issuer}")
         return None
     except (requests.RequestException, ValueError) as e:
         logger.error(f"DEX Screener sync error for {decoded_currency}/{issuer}: {e}")
@@ -223,16 +229,19 @@ def get_dexscreener_price_sync(decoded_currency, issuer):
 def get_dexscreener_price(decoded_currency, issuer, batch_results=None, batch_index=None):
     cache_key = f"dexscreener_{decoded_currency}_{issuer}"
     if cache_key in price_cache:
+        logger.debug(f"Using cached DEX Screener price for {decoded_currency}-{issuer}: {price_cache[cache_key]}")
         return price_cache[cache_key]
     if batch_results and batch_index is not None:
         price = batch_results[batch_index]
         price_cache[cache_key] = price
+        logger.debug(f"DEX Screener batch price for {decoded_currency}-{issuer}: {price}")
         return price
     return get_dexscreener_price_sync(decoded_currency, issuer)
 
 def get_dex_price(currency, issuer):
     cache_key = f"dex_{currency}_{issuer}"
     if cache_key in price_cache:
+        logger.debug(f"Using cached DEX price for {currency}-{issuer}: {price_cache[cache_key]}")
         return price_cache[cache_key]
     def fetch_offers(request):
         try:
@@ -240,27 +249,31 @@ def get_dex_price(currency, issuer):
         except Exception:
             return []
     try:
-        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=3)
-        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=3)
+        buy_request = BookOffers(taker_pays={"currency": "XRP"}, taker_gets={"currency": currency, "issuer": issuer}, limit=10)
+        sell_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=10)
         future_buy = executor.submit(fetch_offers, buy_request)
         future_sell = executor.submit(fetch_offers, sell_request)
         buy_offers = future_buy.result()
         sell_offers = future_sell.result()
-        MIN_OFFERS, MIN_VOLUME = 1, 1000
+        MIN_OFFERS, MIN_VOLUME = 2, 5000  # Stricter requirements
         buy_price = None
-        if buy_offers:
+        if len(buy_offers) >= MIN_OFFERS:
             xrp = sum(float(o["TakerPays"]) / 1_000_000 for o in buy_offers)
             tokens = sum(float(o["TakerGets"]["value"]) for o in buy_offers)
             if tokens >= MIN_VOLUME:
                 buy_price = xrp / tokens
         sell_price = None
-        if sell_offers:
+        if len(sell_offers) >= MIN_OFFERS:
             xrp = sum(float(o["TakerGets"]) / 1_000_000 for o in sell_offers)
             tokens = sum(float(o["TakerPays"]["value"]) for o in sell_offers)
             if tokens >= MIN_VOLUME:
                 sell_price = xrp / tokens
-        price = (buy_price + sell_price) / 2 if buy_price and sell_price else buy_price or sell_price
+        if buy_price and sell_price:
+            price = (buy_price + sell_price) / 2
+        else:
+            price = buy_price or sell_price
         price_cache[cache_key] = price
+        logger.debug(f"XRPL DEX price for {currency}-{issuer}: {price}")
         return price
     except Exception as e:
         logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
@@ -270,6 +283,7 @@ def get_dex_price(currency, issuer):
 def get_historical_price(decoded_currency, issuer, transactions):
     cache_key = f"historical_{decoded_currency}_{issuer}"
     if cache_key in price_cache:
+        logger.debug(f"Using cached historical price for {decoded_currency}-{issuer}: {price_cache[cache_key]}")
         return price_cache[cache_key]
     prices = []
     cutoff = datetime.utcnow() - timedelta(days=60)
@@ -278,29 +292,37 @@ def get_historical_price(decoded_currency, issuer, transactions):
         if tx_time < cutoff or not tx.get('meta'):
             continue
         meta = tx["meta"]
-        if (isinstance(meta.get("delivered_amount"), dict) and 
-            meta["delivered_amount"].get("currency") == decoded_currency and
-            meta["delivered_amount"].get("issuer") == issuer and
-            tx.get("tx", {}).get("TransactionType") in ["Payment", "OfferCreate"]):
-            token_amount = float(meta["delivered_amount"]["value"])
+        tx_type = tx.get("tx", {}).get("TransactionType")
+        if tx_type in ["OfferCreate", "Payment"]:
             for node in meta.get("AffectedNodes", []):
                 if ("ModifiedNode" in node and 
-                    node["ModifiedNode"].get("LedgerEntryType") == "AccountRoot" and 
-                    node["ModifiedNode"].get("FinalFields", {}).get("Account") == tx["tx"]["Account"] and
-                    "PreviousFields" in node["ModifiedNode"] and
-                    "Balance" in node["ModifiedNode"]["PreviousFields"]):
-                    final_balance = int(node["ModifiedNode"]["FinalFields"]["Balance"])
-                    previous_balance = int(node["ModifiedNode"]["PreviousFields"]["Balance"])
-                    xrp_amount = (previous_balance - final_balance) / 1_000_000  # XRP spent
-                    if xrp_amount > 0 and token_amount > 0:
-                        prices.append(xrp_amount / token_amount)
+                    node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and
+                    node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == decoded_currency and
+                    node["ModifiedNode"].get("FinalFields", {}).get("HighLimit", {}).get("issuer") == issuer):
+                    token_balance = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
+                    previous_balance = float(node["ModifiedNode"].get("PreviousFields", {}).get("Balance", {}).get("value", 0))
+                    token_delta = token_balance - previous_balance
+                    if token_delta > 0:  # Token received (buy)
+                        for account_node in meta.get("AffectedNodes", []):
+                            if ("ModifiedNode" in account_node and 
+                                account_node["ModifiedNode"].get("LedgerEntryType") == "AccountRoot" and
+                                account_node["ModifiedNode"].get("FinalFields", {}).get("Account") == tx["tx"]["Account"]):
+                                final_balance = int(account_node["ModifiedNode"]["FinalFields"]["Balance"])
+                                prev_balance = int(account_node["ModifiedNode"].get("PreviousFields", {}).get("Balance", 0))
+                                xrp_delta = (prev_balance - final_balance) / 1_000_000
+                                if xrp_delta > 0:
+                                    price = xrp_delta / token_delta
+                                    prices.append(price)
+                                    logger.debug(f"Historical price for {decoded_currency}-{issuer} from tx {tx['tx']['hash']}: {price}")
     price = sum(prices) / len(prices) if prices else None
     price_cache[cache_key] = price
+    logger.debug(f"Historical price for {decoded_currency}-{issuer}: {price}")
     return price
 
 def get_current_price(currency, issuer, transactions, batch_results=None, batch_index=None):
     cache_key = f"current_{currency}_{issuer}"
     if cache_key in price_cache:
+        logger.debug(f"Using cached current price for {currency}-{issuer}: {price_cache[cache_key]}")
         return price_cache[cache_key]
     decoded_currency = decode_hex_currency(currency)
     for method in (
@@ -312,11 +334,13 @@ def get_current_price(currency, issuer, transactions, batch_results=None, batch_
             price = method()
             if price and price > 0:
                 price_cache[cache_key] = price
+                logger.debug(f"Current price for {currency}-{issuer}: {price}")
                 return price
         except Exception as e:
             logger.error(f"Price method failed for {decoded_currency}/{issuer}: {e}")
             continue
     price_cache[cache_key] = None
+    logger.debug(f"No price found for {currency}-{issuer}")
     return None
 
 def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
@@ -359,15 +383,38 @@ def get_lp_token_value(issuer, amount_held, transactions, amm_info_cache=None):
             return amount_held * value_per_lp
         token_price = get_current_price(token_currency, token_issuer, transactions)
         if token_price is None:
+            logger.warning(f"No price for LP token {token_currency}/{token_issuer}")
             return None
         total_pool_value = amount_xrp + (amount_token * token_price)
         value_per_lp = total_pool_value / lp_tokens_issued
-        return amount_held * value_per_lp
+        current_value = amount_held * value_per_lp
+        logger.debug(f"LP token value for {issuer}: {current_value}")
+        return current_value
     except Exception as e:
         logger.error(f"Error calculating LP token value for {issuer}: {e}")
         return None
 
+def clean_old_transactions():
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        with conn.cursor() as cur:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            cur.execute(
+                """
+                DELETE FROM transactions
+                WHERE fetched_at < %s
+                """,
+                (cutoff,)
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            logger.info(f"Deleted {deleted} old transactions from database")
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error cleaning old transactions: {e}")
+
 def fetch_and_store_transactions(address):
+    clean_old_transactions()  # Clean old data before fetching
     transactions = []
     marker = None
     tx_count = 0
@@ -403,6 +450,7 @@ def fetch_and_store_transactions(address):
                 break
         conn.commit()
     conn.close()
+    logger.info(f"Fetched and stored {len(transactions)} transactions for {address}")
     return transactions
 
 def get_transactions_from_db(address):
@@ -429,8 +477,8 @@ def get_transactions_from_db(address):
             )
             transactions = [row['tx_data'] for row in cur.fetchall()]
             conn.close()
-            if transactions:
-                return transactions
+            logger.info(f"Retrieved {len(transactions)} transactions from DB for {address}")
+            return transactions
     conn.close()
     return fetch_and_store_transactions(address)
 
@@ -451,6 +499,7 @@ def get_token_pnl():
         lines = response.result['lines']
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) for line in lines if float(line['balance']) > 0.0001}
         relevant_tokens = set(holdings.keys())
+        logger.debug(f"Holdings for {address}: {holdings}")
 
         # Check for $UGA or $GNOSIS
         has_uga_or_gnosis = any(token in holdings for token in [
@@ -489,6 +538,7 @@ def get_token_pnl():
                 for token in relevant_tokens:
                     delta_token = changes.get(token, 0)
                     token_changes[token].append((delta_xrp, delta_token))
+                    logger.debug(f"Token change for {token} in tx {tx['tx']['hash']}: XRP={delta_xrp}, Token={delta_token}")
 
         # Batch fetch DEX Screener prices
         currency_issuer_pairs = [(decode_hex_currency(token.split('-')[0]), token.split('-')[1]) for token in holdings]
@@ -505,9 +555,11 @@ def get_token_pnl():
                 if delta_xrp < 0 and delta_token > 0:  # Buy
                     price = -delta_xrp / delta_token
                     buys.append({'amount': delta_token, 'price': price})
+                    logger.debug(f"Buy detected for {currency_name}-{issuer}: {delta_token} tokens at {price} XRP each")
                 elif delta_xrp > 0 and delta_token < 0:  # Sell
                     sell_amount = -delta_token
                     sell_value = delta_xrp
+                    logger.debug(f"Sell detected for {currency_name}-{issuer}: {sell_amount} tokens for {sell_value} XRP")
                     while sell_amount > 0 and buys:
                         buy = buys[0]
                         if buy['amount'] <= sell_amount:
@@ -538,6 +590,7 @@ def get_token_pnl():
                 'total_pnl': total_pnl,
                 'price_unavailable': current_value is None
             }
+            logger.debug(f"Token data for {currency_name}-{issuer}: {token_data}")
             if is_amm_lp:
                 amm_lp_tokens.append(token_data)
             else:
