@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Import flask_cors
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountLines, AccountObjects
 from xrpl.models.requests.account_objects import AccountObjectType
@@ -6,6 +7,15 @@ import asyncio
 import logging
 
 app = Flask(__name__)
+
+# Enable CORS for specific origins
+CORS(app, resources={
+    r"/token_pnl": {
+        "origins": ["https://chaps420.github.io"],  # Allow your frontend origin
+        "methods": ["POST", "OPTIONS"],  # Allow POST and OPTIONS requests
+        "allow_headers": ["Content-Type"]  # Allow Content-Type header
+    }
+})
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -70,10 +80,14 @@ async def get_wallet_tokens(address):
         logger.error(f"Error fetching wallet tokens: {str(e)}")
         return {"error": f"Server error: {str(e)}"}
 
-@app.route('/token_pnl', methods=['POST'])
+@app.route('/token_pnl', methods=['POST', 'OPTIONS'])
 async def token_pnl():
     """API endpoint to fetch current token balances for a given XRPL wallet address."""
     try:
+        # Handle preflight OPTIONS request
+        if request.method == "OPTIONS":
+            return jsonify({}), 200
+
         data = request.get_json()
         address = data.get("address", "").strip()
 
