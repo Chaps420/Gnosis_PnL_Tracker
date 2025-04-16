@@ -1,19 +1,31 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import xrpl
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountTx, AccountLines, BookOffers, AMMInfo
 from datetime import datetime, timedelta
 from collections import deque
 import logging
-import requests
+import aiohttp
+import asyncio
+from cachetools import TTLCache
+from tenacity import retry, stop_after_attempt, wait_exponential
+from functools import lru_cache
 import binascii
 
 app = Flask(__name__)
 CORS(app)
 
+# Rate limiting
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["10 per minute"]
+)
+
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # XRPL client setup
@@ -22,6 +34,11 @@ client = JsonRpcClient(JSON_RPC_URL)
 
 # DEX Screener API setup
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
+
+# In-memory caches (TTL: 5 minutes)
+price_cache = TTLCache(maxsize=1000, ttl=300)
+amm_cache = TTLCache(maxsize=100, ttl=300)
+pnl_cache = TTLCache(maxsize=100, ttl=300)
 
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
@@ -33,11 +50,17 @@ def decode_hex_currency(hex_code):
             pass
     return hex_code
 
+@lru_cache(maxsize=1000)
 def decode_currency(currency, issuer):
     """Decode currency and identify AMM LP tokens using AMMInfo."""
     if len(currency) == 40 and all(c in '0123456789ABCDEFabcdef' for c in currency):
         try:
-            amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+            cache_key = f"amm:{issuer}"
+            if cache_key in amm_cache:
+                amm_info = amm_cache[cache_key]
+            else:
+                amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+                amm_cache[cache_key] = amm_info
             required_fields = ["lp_token", "amount", "amount2"]
             if all(field in amm_info for field in required_fields):
                 asset1 = amm_info["amount"]
@@ -45,8 +68,7 @@ def decode_currency(currency, issuer):
                 asset1_str = "XRP" if isinstance(asset1, str) else decode_hex_currency(asset1["currency"])
                 asset2_str = "XRP" if isinstance(asset2, str) else decode_hex_currency(asset2["currency"])
                 return f"LP_{asset1_str}_{asset2_str}", True
-            else:
-                return decode_hex_currency(currency), False
+            return decode_hex_currency(currency), False
         except Exception as e:
             logger.debug(f"AMMInfo failed for {issuer}: {e}")
             return decode_hex_currency(currency), False
@@ -79,64 +101,47 @@ def get_balance_changes(meta, address):
                         previous_balance = float(previous_fields['Balance']['value'])
                         delta = final_balance - previous_balance
                         changes[token_key] = changes.get(token_key, 0) + (delta if low == address else -delta)
-        elif 'CreatedNode' in node:
-            created = node['CreatedNode']
-            if created.get('LedgerEntryType') == 'RippleState':
-                new_fields = created.get('NewFields', {})
-                high = new_fields.get('HighLimit', {}).get('issuer')
-                low = new_fields.get('LowLimit', {}).get('issuer')
-                if high == address or low == address:
-                    currency = new_fields.get('Balance', {}).get('currency')
-                    issuer = high if low == address else low
-                    token_key = f"{currency}-{issuer}"
-                    balance = float(new_fields.get('Balance', {}).get('value', 0))
-                    changes[token_key] = changes.get(token_key, 0) + (balance if low == address else -balance)
-        elif 'DeletedNode' in node:
-            deleted = node['DeletedNode']
-            if deleted.get('LedgerEntryType') == 'RippleState':
-                final_fields = deleted.get('FinalFields', {})
-                high = final_fields.get('HighLimit', {}).get('issuer')
-                low = final_fields.get('LowLimit', {}).get('issuer')
-                if high == address or low == address:
-                    currency = final_fields.get('Balance', {}).get('currency')
-                    issuer = high if low == address else low
-                    token_key = f"{currency}-{issuer}"
-                    balance = float(final_fields.get('Balance', {}).get('value', 0))
-                    changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
     return changes
 
-def get_current_price(currency, issuer, transactions):
-    """Fetch current token price in XRP with fallbacks."""
-    decoded_currency = decode_hex_currency(currency)
-
-    def get_dexscreener_price():
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
+async def fetch_dexscreener_price(decoded_currency):
+    """Fetch price from DEX Screener with retry logic."""
+    async with aiohttp.ClientSession() as session:
         try:
             url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
-            response = requests.get(url, timeout=5).json()
-            for pair in response.get('pairs', []):
-                if (pair.get('chainId') == 'xrpl' and 
-                    pair.get('baseToken', {}).get('symbol') == decoded_currency and 
-                    pair.get('quoteToken', {}).get('symbol') == 'XRP'):
-                    return float(pair.get('priceNative', '0'))
-            return None
+            async with session.get(url, timeout=5) as response:
+                data = await response.json()
+                for pair in data.get('pairs', []):
+                    if (pair.get('chainId') == 'xrpl' and
+                        pair.get('baseToken', {}).get('symbol') == decoded_currency and
+                        pair.get('quoteToken', {}).get('symbol') == 'XRP'):
+                        return float(pair.get('priceNative', '0'))
+                return None
         except Exception as e:
-            logger.error(f"DEX Screener error for {decoded_currency}-{issuer}: {e}")
+            logger.error(f"DEX Screener error for {decoded_currency}: {e}")
             return None
+
+async def get_current_price(currency, issuer, transactions):
+    """Fetch current token price in XRP with fallbacks."""
+    cache_key = f"{currency}-{issuer}"
+    if cache_key in price_cache:
+        return price_cache[cache_key]
+
+    decoded_currency = decode_hex_currency(currency)
 
     def get_dex_price():
         try:
             buy_offers = client.request(BookOffers(
                 taker_pays={"currency": "XRP"},
                 taker_gets={"currency": currency, "issuer": issuer},
-                limit=10
+                limit=5
             )).result.get("offers", [])
             sell_offers = client.request(BookOffers(
                 taker_gets={"currency": "XRP"},
                 taker_pays={"currency": currency, "issuer": issuer},
-                limit=10
+                limit=5
             )).result.get("offers", [])
-
-            MIN_OFFERS, MIN_VOLUME = 2, 10000
+            MIN_OFFERS, MIN_VOLUME = 2, 1000
             buy_price = None
             if len(buy_offers) >= MIN_OFFERS:
                 xrp = sum(float(o["TakerPays"]) / 1_000_000 for o in buy_offers)
@@ -159,7 +164,7 @@ def get_current_price(currency, issuer, transactions):
     def get_historical_price():
         prices = []
         cutoff = datetime.utcnow() - timedelta(days=30)
-        for tx in transactions:
+        for tx in transactions[:100]:
             tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
             if tx_time < cutoff or not tx.get('meta') or "delivered_amount" not in tx["meta"]:
                 continue
@@ -167,35 +172,49 @@ def get_current_price(currency, issuer, transactions):
             if isinstance(meta["delivered_amount"], dict) and meta["delivered_amount"]["currency"] == "XRP":
                 xrp = float(meta["delivered_amount"]["value"]) / 1_000_000
                 for node in meta.get("AffectedNodes", []):
-                    if ("ModifiedNode" in node and 
-                        node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and 
-                        node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == currency and 
+                    if ("ModifiedNode" in node and
+                        node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and
+                        node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == currency and
                         node["ModifiedNode"].get("HighLimit", {}).get("issuer") == issuer):
                         token = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
                         if token != 0:
                             prices.append(xrp / abs(token))
         return sum(prices) / len(prices) if prices else None
 
-    for method in (get_dexscreener_price, get_dex_price, get_historical_price):
-        price = method()
-        if price and price > 0.000001:
+    loop = asyncio.get_event_loop()
+    tasks = [
+        fetch_dexscreener_price(decoded_currency),
+        loop.run_in_executor(None, get_dex_price),
+        loop.run_in_executor(None, get_historical_price)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for price in results:
+        if isinstance(price, float) and price > 0.000001:
+            price_cache[cache_key] = price
             return price
-    return 0.000001
+    price = 0.000001
+    price_cache[cache_key] = price
+    return price
 
-def get_lp_token_value(issuer, amount_held, transactions):
+async def get_lp_token_value(issuer, amount_held, transactions):
     """Calculate LP token value based on AMM pool data."""
     try:
-        amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+        cache_key = f"amm:{issuer}"
+        if cache_key in amm_cache:
+            amm_info = amm_cache[cache_key]
+        else:
+            amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+            amm_cache[cache_key] = amm_info
         lp_tokens_issued = float(amm_info["lp_token"]["value"])
         asset1 = amm_info["amount"]
         asset2 = amm_info["amount2"]
 
-        if isinstance(asset1, str):  # XRP is asset1
+        if isinstance(asset1, str):
             amount_xrp = float(asset1) / 1_000_000
             token_currency = asset2["currency"]
             token_issuer = asset2["issuer"]
             amount_token = float(asset2["value"])
-        elif isinstance(asset2, str):  # XRP is asset2
+        elif isinstance(asset2, str):
             amount_xrp = float(asset2) / 1_000_000
             token_currency = asset1["currency"]
             token_issuer = asset1["issuer"]
@@ -204,7 +223,7 @@ def get_lp_token_value(issuer, amount_held, transactions):
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
             return 0
 
-        token_price = get_current_price(token_currency, token_issuer, transactions)
+        token_price = await get_current_price(token_currency, token_issuer, transactions)
         total_pool_value = amount_xrp + (amount_token * token_price)
         value_per_lp = total_pool_value / lp_tokens_issued
         return amount_held * value_per_lp
@@ -213,24 +232,31 @@ def get_lp_token_value(issuer, amount_held, transactions):
         return 0
 
 @app.route('/token_pnl', methods=['POST'])
+@limiter.limit("10 per minute")
 def get_token_pnl():
     """Calculate token PNL, separating AMM LP tokens."""
     data = request.json
     address = data.get('address')
-
     if not address:
         return jsonify({'error': 'Wallet address is required'}), 400
 
     try:
-        # Fetch transactions
+        # Check PNL cache
+        cache_key = f"pnl:{address}"
+        if cache_key in pnl_cache:
+            return jsonify(pnl_cache[cache_key])
+
+        # Fetch transactions (limited to 30 days)
         transactions = []
+        cutoff_time = datetime.utcnow() - timedelta(days=30)
         marker = None
-        while True:
+        max_txs = 200
+        while len(transactions) < max_txs:
             req = AccountTx(
                 account=address,
                 ledger_index_min=-1,
                 ledger_index_max=-1,
-                limit=100,
+                limit=50,
                 marker=marker,
                 forward=True
             )
@@ -238,29 +264,31 @@ def get_token_pnl():
             result = response.result
             for tx in result.get('transactions', []):
                 tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                if tx_time < cutoff_time:
+                    break
                 transactions.append(tx)
             marker = result.get('marker')
-            if not marker:
+            if not marker or tx_time < cutoff_time:
                 break
 
         # Fetch current holdings
         req = AccountLines(account=address)
         response = client.request(req)
         lines = response.result['lines']
-        holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
-                    for line in lines if float(line['balance']) > 0.001}  # Filter dust
+        holdings = {f"{line['currency']}-{line['account']}": float(line['balance'])
+                    for line in lines if float(line['balance']) > 0.001}
 
         xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
 
         regular_tokens = []
         amm_lp_tokens = []
+        loop = asyncio.get_event_loop()
         for token, amount_held in holdings.items():
             currency, issuer = token.split('-')
             currency_name, is_amm_lp = decode_currency(currency, issuer)
             buys = deque()
             realized_pnl = 0.0
 
-            # Process transactions
             for tx in transactions:
                 tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
                 meta = tx.get('meta', {})
@@ -287,8 +315,8 @@ def get_token_pnl():
                                     sell_amount = 0
 
             cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
-            current_value = (get_lp_token_value(issuer, amount_held, transactions) if is_amm_lp 
-                            else amount_held * get_current_price(currency, issuer, transactions))
+            current_value = (loop.run_until_complete(get_lp_token_value(issuer, amount_held, transactions)) if is_amm_lp
+                            else amount_held * loop.run_until_complete(get_current_price(currency, issuer, transactions)))
             unrealized_pnl = current_value - cost_basis
             total_pnl = realized_pnl + unrealized_pnl
 
@@ -308,18 +336,26 @@ def get_token_pnl():
             else:
                 regular_tokens.append(token_data)
 
-        # Sort by current_value
         regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
         amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
 
-        return jsonify({
+        result = {
             'xrp_balance': xrp_balance,
             'tokens': regular_tokens,
             'amm_lp_tokens': amm_lp_tokens
-        })
+        }
+
+        # Cache result
+        pnl_cache[cache_key] = result
+        return jsonify(result)
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'xrp_balance': 0,
+            'tokens': [],
+            'amm_lp_tokens': [],
+            'error': 'Partial or no data available due to processing error'
+        }), 200
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+    app.run(debug=False, host='0.0.0.0', port=8000)
