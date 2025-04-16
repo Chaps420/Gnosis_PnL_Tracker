@@ -12,7 +12,6 @@ import psycopg2
 from psycopg2 import pool
 import json
 from functools import lru_cache
-import time
 
 app = Flask(__name__)
 CORS(app)
@@ -280,12 +279,14 @@ def fetch_and_store_transactions(address):
                     (addr, tx_hash, json.dumps(tx_data), tx_time)
                 )
             conn.commit()
+            logger.debug(f"Stored {len(transactions)} transactions for address {address}")
+            return transactions
     except Exception as e:
         logger.error(f"Error fetching/storing transactions: {e}")
         conn.rollback()
+        return []
     finally:
         db_pool.putconn(conn)
-    return transactions
 
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
@@ -313,11 +314,13 @@ def get_token_pnl():
                     (address, datetime.utcnow() - timedelta(hours=1))
                 )
                 transactions = [row[0] for row in cur.fetchall()]
+                logger.debug(f"Retrieved {len(transactions)} recent transactions from DB for {address}")
         finally:
             db_pool.putconn(conn)
 
         # If no recent transactions, fetch and store new ones
         if not transactions:
+            logger.debug(f"No recent transactions found for {address}, fetching from XRPL")
             fetch_and_store_transactions(address)
             conn = db_pool.getconn()
             try:
@@ -327,6 +330,7 @@ def get_token_pnl():
                         (address,)
                     )
                     transactions = [row[0] for row in cur.fetchall()]
+                    logger.debug(f"Retrieved {len(transactions)} transactions from DB after fetch for {address}")
             finally:
                 db_pool.putconn(conn)
 
@@ -359,6 +363,7 @@ def get_token_pnl():
                         if delta_xrp < 0 and delta_token > 0:  # Buy
                             price = -delta_xrp / delta_token
                             buys.append({'amount': delta_token, 'price': price})
+                            logger.debug(f"Buy detected for {currency_name}: {delta_token} tokens at {price} XRP/token")
                         elif delta_xrp > 0 and delta_token < 0:  # Sell
                             sell_amount = -delta_token
                             sell_value = delta_xrp
@@ -372,8 +377,10 @@ def get_token_pnl():
                                     realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
                                     buy['amount'] -= sell_amount
                                     sell_amount = 0
+                            logger.debug(f"Sell detected for {currency_name}: {sell_amount} tokens, realized PNL: {realized_pnl}")
 
             cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
+            logger.debug(f"Cost basis for {currency_name}: {cost_basis} XRP, buys: {list(buys)}")
             current_value = (get_lp_token_value(issuer, amount_held, transactions) if is_amm_lp 
                             else amount_held * get_current_price(currency, issuer, f"{currency}-{issuer}"))
             unrealized_pnl = current_value - cost_basis
@@ -383,7 +390,7 @@ def get_token_pnl():
                 'currency': currency_name,
                 'issuer': issuer,
                 'amount_held': amount_held,
-                'initial_investment': cost_basis,
+                'initial_investment': cost_basis,  # Ensure this is included
                 'current_value': current_value,
                 'realized_pnl': realized_pnl,
                 'unrealized_pnl': unrealized_pnl,
