@@ -2,7 +2,5 @@ flask
 flask-cors
 xrpl-py
 requests
-cachetools
-aiohttp
 gunicorn
 psycopg2-binary
