@@ -3,7 +3,7 @@ from flask_cors import CORS
 import xrpl
 from xrpl.clients import JsonRpcClient
 from xrpl.models.requests import AccountTx, AccountLines
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from collections import deque
 import requests
@@ -20,8 +20,23 @@ logger = logging.getLogger(__name__)
 JSON_RPC_URL = "https://s1.ripple.com:51234/"
 client = JsonRpcClient(JSON_RPC_URL)
 
+# DEX Screener API setup
+DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
+
 # Constants
 START_DATE = datetime(2024, 9, 1)  # Transactions starting from September 1, 2024
+
+
+def decode_hex_currency(hex_code):
+    """Decode a 40-character hex currency code to ASCII."""
+    if len(hex_code) == 40 and all(c in '0123456789ABCDEFabcdef' for c in hex_code):
+        try:
+            bytes_code = binascii.unhexlify(hex_code)
+            return bytes_code.split(b'\0', 1)[0].decode('ascii')
+        except Exception:
+            pass
+    return hex_code
+
 
 def fetch_transactions_since(address, start_date):
     """Fetch transactions since a specific date."""
@@ -47,6 +62,49 @@ def fetch_transactions_since(address, start_date):
             break
     return transactions
 
+
+def get_current_price(currency, issuer, transactions):
+    """Fetch current token price in XRP with improved fallbacks."""
+    def get_dexscreener_price():
+        try:
+            url = f"{DEXSCREENER_API_URL}?q={currency}"
+            response = requests.get(url, timeout=5).json()
+            for pair in response.get('pairs', []):
+                if (pair.get('chainId') == 'xrpl' and
+                        pair.get('baseToken', {}).get('symbol') == currency and
+                        pair.get('quoteToken', {}).get('symbol') == 'XRP'):
+                    return float(pair.get('priceNative', '0'))
+            return None
+        except Exception as e:
+            logger.error(f"DEX Screener error for {currency}-{issuer}: {e}")
+            return None
+
+    def get_historical_price():
+        prices = []
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        for tx in transactions:
+            tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+            if tx_time < cutoff:
+                continue
+            meta = tx.get("meta")
+            if isinstance(meta["delivered_amount"], dict) and meta["delivered_amount"]["currency"] == "XRP":
+                xrp = float(meta["delivered_amount"]["value"])
+                for node in meta.get("AffectedNodes", []):
+                    if ("ModifiedNode" in node and
+                            node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and
+                            node["ModifiedNode"]["FinalFields"]["Balance"]["currency"] == currency):
+                        token = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
+                        if token != 0:
+                            prices.append(xrp / abs(token))
+        return sum(prices) / len(prices) if prices else None
+
+    for method in (get_dexscreener_price, get_historical_price):
+        price = method()
+        if price:
+            return price
+    return 0.000001  # Fallback price
+
+
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
     """Calculate token PNL, separating AMM LP tokens."""
@@ -64,13 +122,12 @@ def get_token_pnl():
         req = AccountLines(account=address)
         response = client.request(req)
         lines = response.result['lines']
-        holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
+        holdings = {f"{line['currency']}-{line['account']}": float(line['balance'])
                     for line in lines if float(line['balance']) > 0.001}  # Filter out dust
 
         xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
 
         regular_tokens = []
-        amm_lp_tokens = []
         for token, amount_held in holdings.items():
             currency, issuer = token.split('-')
             buys = deque()
@@ -84,7 +141,7 @@ def get_token_pnl():
                     cost = 0
                     for other, delta_other in changes.items():
                         if other != token and delta_other < 0:
-                            price_other = get_asset_price(other, transactions)
+                            price_other = get_current_price(*other.split('-'), transactions)
                             cost += -delta_other * price_other
                     price = cost / delta_token if delta_token > 0 else 0
                     buys.append({'amount': delta_token, 'price': price})
@@ -93,7 +150,7 @@ def get_token_pnl():
                     proceeds = 0
                     for other, delta_other in changes.items():
                         if other != token and delta_other > 0:
-                            price_other = get_asset_price(other, transactions)
+                            price_other = get_current_price(*other.split('-'), transactions)
                             proceeds += delta_other * price_other
                     sell_amount = -delta_token
                     sell_value = proceeds
@@ -133,6 +190,7 @@ def get_token_pnl():
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
