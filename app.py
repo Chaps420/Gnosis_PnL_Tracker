@@ -239,6 +239,14 @@ def get_lp_token_value(issuer, amount_held, transactions):
         logger.error(f"Error calculating LP token value for {issuer}: {e}", exc_info=True)
         return 0
 
+def get_asset_price(asset_key, transactions):
+    """Get the price of an asset in XRP."""
+    if asset_key == 'XRP':
+        return 1
+    else:
+        currency, issuer = asset_key.split('-')
+        return get_current_price(currency, issuer, transactions)
+
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
     """Calculate token PNL, separating AMM LP tokens."""
@@ -287,32 +295,37 @@ def get_token_pnl():
             buys = deque()
             realized_pnl = 0.0
 
-            # Process transactions
+            # Process transactions with generalized buy/sell detection
             for tx in transactions:
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                meta = tx.get('meta', {})
-                if isinstance(meta, dict):
-                    changes = get_balance_changes(meta, address)
-                    delta_xrp = changes.get('XRP', 0) / 1_000_000
-                    if token in changes:
-                        delta_token = changes[token]
-                        if delta_xrp < 0 and delta_token > 0:  # Buy
-                            price = -delta_xrp / delta_token
-                            buys.append({'amount': delta_token, 'price': price})
-                            logger.debug(f"Buy detected for {token}: {delta_token} @ {price}")
-                        elif delta_xrp > 0 and delta_token < 0:  # Sell
-                            sell_amount = -delta_token
-                            sell_value = delta_xrp
-                            while sell_amount > 0 and buys:
-                                buy = buys[0]
-                                if buy['amount'] <= sell_amount:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * buy['amount']
-                                    sell_amount -= buy['amount']
-                                    buys.popleft()
-                                else:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
-                                    buy['amount'] -= sell_amount
-                                    sell_amount = 0
+                changes = get_balance_changes(tx['meta'], address)
+                delta_token = changes.get(token, 0)
+                if delta_token > 0:  # Buy
+                    cost = 0
+                    for other, delta_other in changes.items():
+                        if other != token and delta_other < 0:
+                            price_other = get_asset_price(other, transactions)
+                            cost += -delta_other * price_other
+                    price = cost / delta_token if delta_token > 0 else 0
+                    buys.append({'amount': delta_token, 'price': price})
+                    logger.debug(f"Buy detected for {token}: {delta_token} @ {price}")
+                elif delta_token < 0:  # Sell
+                    proceeds = 0
+                    for other, delta_other in changes.items():
+                        if other != token and delta_other > 0:
+                            price_other = get_asset_price(other, transactions)
+                            proceeds += delta_other * price_other
+                    sell_amount = -delta_token
+                    sell_value = proceeds
+                    while sell_amount > 0 and buys:
+                        buy = buys[0]
+                        if buy['amount'] <= sell_amount:
+                            realized_pnl += (sell_value / sell_amount - buy['price']) * buy['amount']
+                            sell_amount -= buy['amount']
+                            buys.popleft()
+                        else:
+                            realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
+                            buy['amount'] -= sell_amount
+                            sell_amount = 0
 
             cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
             current_value = (get_lp_token_value(issuer, amount_held, transactions) if is_amm_lp 
