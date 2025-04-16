@@ -3,4 +3,8 @@ flask-cors
 xrpl-py
 requests
 gunicorn
-psycopg2-binary
+gevent
+aiohttp
+cachetools
+tenacity
+flask-limiter
