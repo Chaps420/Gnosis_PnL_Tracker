@@ -7,9 +7,10 @@ from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
 import decimal
 
+# Initialize Flask app
 app = Flask(__name__)
 
-# Enable CORS
+# Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
         "origins": ["https://chaps420.github.io", "http://localhost:3000"],
@@ -18,57 +19,64 @@ CORS(app, resources={
     }
 })
 
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
 XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
+# Uncomment below for testnet
 # XRPL_CLIENT = JsonRpcClient("https://s.altnet.rippletest.net:51234/")  # Testnet
 
-def get_token_price_in_xrp(currency, issuer, amount=1):
-    """Fetch the price of a token in XRP from the XRPL DEX order book."""
+def get_token_price_in_xrp(currency, issuer):
+    """Fetch the price of a token in XRP from the XRPL DEX order book using mid-price."""
     try:
-        # Define the trading pair (token/XRP)
-        book_request = BookOffers(
+        # Fetch bid order book (buying token with XRP)
+        book_request_bids = BookOffers(
             taker_gets={"currency": "XRP"},
             taker_pays={"currency": currency, "issuer": issuer},
-            limit=10
+            limit=1
         )
-        book_response = XRPL_CLIENT.request(book_request)
+        book_response_bids = XRPL_CLIENT.request(book_request_bids)
+        bid_price = None
+        if book_response_bids.is_successful() and book_response_bids.result.get("offers"):
+            offer = book_response_bids.result["offers"][0]
+            taker_gets = float(drops_to_xrp(offer["TakerGets"]))
+            taker_pays = float(offer["TakerPays"]["value"])
+            if taker_pays != 0:
+                bid_price = taker_gets / taker_pays
+                logger.info(f"Bid price for {currency}/{issuer}: {bid_price} XRP")
 
-        if not book_response.is_successful() or not book_response.result.get("offers"):
+        # Fetch ask order book (selling token for XRP)
+        book_request_asks = BookOffers(
+            taker_gets={"currency": currency, "issuer": issuer},
+            taker_pays={"currency": "XRP"},
+            limit=1
+        )
+        book_response_asks = XRPL_CLIENT.request(book_request_asks)
+        ask_price = None
+        if book_response_asks.is_successful() and book_response_asks.result.get("offers"):
+            offer = book_response_asks.result["offers"][0]
+            taker_gets = float(offer["TakerGets"]["value"])
+            taker_pays = float(drops_to_xrp(offer["TakerPays"]))
+            if taker_gets != 0:
+                ask_price = taker_pays / taker_gets
+                logger.info(f"Ask price for {currency}/{issuer}: {ask_price} XRP")
+
+        # Calculate mid-price or fallback to available price
+        if bid_price is not None and ask_price is not None:
+            mid_price = (bid_price + ask_price) / 2
+            logger.info(f"Mid price for {currency}/{issuer}: {mid_price} XRP")
+            return mid_price
+        elif bid_price is not None:
+            logger.info(f"Only bid price for {currency}/{issuer}: {bid_price} XRP")
+            return bid_price
+        elif ask_price is not None:
+            logger.info(f"Only ask price for {currency}/{issuer}: {ask_price} XRP")
+            return ask_price
+        else:
             logger.warning(f"No order book data for {currency}/{issuer}")
             return None
-
-        # Calculate average price from bids (taker_pays/taker_gets)
-        total_price = 0
-        total_quantity = 0
-        for offer in book_response.result["offers"]:
-            # Handle taker_gets (XRP or token)
-            if isinstance(offer["TakerGets"], dict):
-                taker_gets = float(offer["TakerGets"]["value"])
-            else:
-                taker_gets = float(drops_to_xrp(offer["TakerGets"]))
-
-            # Handle taker_pays (token)
-            if isinstance(offer["TakerPays"], dict):
-                taker_pays = float(offer["TakerPays"]["value"])
-            else:
-                taker_pays = float(drops_to_xrp(offer["TakerPays"]))
-
-            # Ensure both are floats to avoid decimal.Decimal issues
-            price = taker_pays / taker_gets if taker_gets != 0 else 0
-            total_price += price * taker_gets
-            total_quantity += taker_gets
-
-        if total_quantity == 0:
-            logger.warning(f"No valid quantity for {currency}/{issuer}")
-            return None
-
-        avg_price = total_price / total_quantity
-        logger.info(f"Price for {currency}/{issuer}: {avg_price} XRP")
-        return avg_price
 
     except Exception as e:
         logger.error(f"Error fetching price for {currency}/{issuer}: {str(e)}")
@@ -138,7 +146,7 @@ def get_wallet_tokens(address):
             "amm_lp_tokens": []
         }
 
-        # 1. Fetch regular tokens (trust lines) using AccountLines
+        # Fetch regular tokens (trust lines) using AccountLines
         account_lines_request = AccountLines(account=address)
         account_lines_response = XRPL_CLIENT.request(account_lines_request)
         
@@ -158,7 +166,7 @@ def get_wallet_tokens(address):
             logger.error(f"Failed to fetch account lines: {account_lines_response.result}")
             return {"error": "Failed to fetch regular tokens"}
 
-        # 2. Fetch AMM LP tokens using AccountObjects
+        # Fetch AMM LP tokens using AccountObjects
         account_objects_request = AccountObjects(
             account=address,
             type=AccountObjectType.AMM
