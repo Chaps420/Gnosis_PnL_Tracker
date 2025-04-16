@@ -1,325 +1,210 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import xrpl
 from xrpl.clients import JsonRpcClient
-from xrpl.models.requests import AccountTx, AccountLines, BookOffers, AMMInfo
-from datetime import datetime, timedelta
-from collections import deque
+from xrpl.models.requests import AccountLines, AccountObjects, BookOffers, AMMInfo
+from xrpl.models.requests.account_objects import AccountObjectType
+from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
-import requests
-import binascii
 
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+
+# Enable CORS for specific origins
+CORS(app, resources={
+    r"/token_pnl": {
+        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# XRPL client setup
-JSON_RPC_URL = "https://s1.ripple.com:51234/"
-client = JsonRpcClient(JSON_RPC_URL)
+# XRPL client (mainnet)
+XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
 
-# DEX Screener API setup
-DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
-
-def decode_hex_currency(hex_code):
-    """Decode a 40-character hex currency code to ASCII."""
-    if len(hex_code) == 40 and all(c in '0123456789ABCDEFabcdef' for c in hex_code):
-        try:
-            bytes_code = binascii.unhexlify(hex_code)
-            return bytes_code.split(b'\0', 1)[0].decode('ascii')
-        except Exception:
-            pass
-    return hex_code
-
-def decode_currency(currency, issuer):
-    """Decode currency and identify AMM LP tokens using AMMInfo."""
-    if len(currency) == 40 and all(c in '0123456789ABCDEFabcdef' for c in currency):
-        try:
-            amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
-            required_fields = ["lp_token", "amount", "amount2"]
-            if all(field in amm_info for field in required_fields):
-                asset1 = amm_info["amount"]
-                asset2 = amm_info["amount2"]
-                asset1_str = "XRP" if isinstance(asset1, str) else decode_hex_currency(asset1["currency"])
-                asset2_str = "XRP" if isinstance(asset2, str) else decode_hex_currency(asset2["currency"])
-                return f"LP_{asset1_str}_{asset2_str}", True
-            else:
-                return decode_hex_currency(currency), False
-        except Exception as e:
-            logger.debug(f"AMMInfo failed for {issuer}: {e}")
-            return decode_hex_currency(currency), False
-    return currency, False
-
-def get_balance_changes(meta, address):
-    """Extract balance changes from transaction metadata."""
-    changes = {'XRP': 0}
-    for node in meta.get('AffectedNodes', []):
-        if 'ModifiedNode' in node:
-            modified = node['ModifiedNode']
-            if modified.get('LedgerEntryType') == 'AccountRoot' and 'PreviousFields' in modified:
-                final_fields = modified.get('FinalFields', {})
-                previous_fields = modified.get('PreviousFields', {})
-                if final_fields.get('Account') == address and 'Balance' in previous_fields:
-                    final_balance = int(final_fields.get('Balance', 0))
-                    previous_balance = int(previous_fields['Balance'])
-                    changes['XRP'] += final_balance - previous_balance
-            elif modified.get('LedgerEntryType') == 'RippleState' and 'PreviousFields' in modified:
-                final_fields = modified.get('FinalFields', {})
-                previous_fields = modified.get('PreviousFields', {})
-                if 'Balance' in previous_fields:
-                    high = final_fields.get('HighLimit', {}).get('issuer')
-                    low = final_fields.get('LowLimit', {}).get('issuer')
-                    if high == address or low == address:
-                        currency = final_fields.get('Balance', {}).get('currency')
-                        issuer = high if low == address else low
-                        token_key = f"{currency}-{issuer}"
-                        final_balance = float(final_fields.get('Balance', {}).get('value', 0))
-                        previous_balance = float(previous_fields['Balance']['value'])
-                        delta = final_balance - previous_balance
-                        changes[token_key] = changes.get(token_key, 0) + (delta if low == address else -delta)
-        elif 'CreatedNode' in node:
-            created = node['CreatedNode']
-            if created.get('LedgerEntryType') == 'RippleState':
-                new_fields = created.get('NewFields', {})
-                high = new_fields.get('HighLimit', {}).get('issuer')
-                low = new_fields.get('LowLimit', {}).get('issuer')
-                if high == address or low == address:
-                    currency = new_fields.get('Balance', {}).get('currency')
-                    issuer = high if low == address else low
-                    token_key = f"{currency}-{issuer}"
-                    balance = float(new_fields.get('Balance', {}).get('value', 0))
-                    changes[token_key] = changes.get(token_key, 0) + (balance if low == address else -balance)
-        elif 'DeletedNode' in node:
-            deleted = node['DeletedNode']
-            if deleted.get('LedgerEntryType') == 'RippleState':
-                final_fields = deleted.get('FinalFields', {})
-                high = final_fields.get('HighLimit', {}).get('issuer')
-                low = final_fields.get('LowLimit', {}).get('issuer')
-                if high == address or low == address:
-                    currency = final_fields.get('Balance', {}).get('currency')
-                    issuer = high if low == address else low
-                    token_key = f"{currency}-{issuer}"
-                    balance = float(final_fields.get('Balance', {}).get('value', 0))
-                    changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
-    return changes
-
-def get_current_price(currency, issuer, transactions):
-    """Fetch current token price in XRP with fallbacks."""
-    decoded_currency = decode_hex_currency(currency)
-
-    def get_dexscreener_price():
-        try:
-            url = f"{DEXSCREENER_API_URL}?q={decoded_currency}"
-            response = requests.get(url, timeout=5).json()
-            for pair in response.get('pairs', []):
-                if (pair.get('chainId') == 'xrpl' and 
-                    pair.get('baseToken', {}).get('symbol') == decoded_currency and 
-                    pair.get('quoteToken', {}).get('symbol') == 'XRP'):
-                    return float(pair.get('priceNative', '0'))
-            return None
-        except Exception as e:
-            logger.error(f"DEX Screener error for {decoded_currency}-{issuer}: {e}")
-            return None
-
-    def get_dex_price():
-        try:
-            buy_offers = client.request(BookOffers(
-                taker_pays={"currency": "XRP"},
-                taker_gets={"currency": currency, "issuer": issuer},
-                limit=10
-            )).result.get("offers", [])
-            sell_offers = client.request(BookOffers(
-                taker_gets={"currency": "XRP"},
-                taker_pays={"currency": currency, "issuer": issuer},
-                limit=10
-            )).result.get("offers", [])
-
-            MIN_OFFERS, MIN_VOLUME = 2, 10000
-            buy_price = None
-            if len(buy_offers) >= MIN_OFFERS:
-                xrp = sum(float(o["TakerPays"]) / 1_000_000 for o in buy_offers)
-                tokens = sum(float(o["TakerGets"]["value"]) for o in buy_offers)
-                if tokens >= MIN_VOLUME:
-                    buy_price = xrp / tokens
-            sell_price = None
-            if len(sell_offers) >= MIN_OFFERS:
-                xrp = sum(float(o["TakerGets"]) / 1_000_000 for o in sell_offers)
-                tokens = sum(float(o["TakerPays"]["value"]) for o in sell_offers)
-                if tokens >= MIN_VOLUME:
-                    sell_price = xrp / tokens
-            if buy_price and sell_price:
-                return (buy_price + sell_price) / 2
-            return buy_price or sell_price or 0.000001
-        except Exception as e:
-            logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
-            return 0.000001
-
-    def get_historical_price():
-        prices = []
-        cutoff = datetime.utcnow() - timedelta(days=30)
-        for tx in transactions:
-            tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-            if tx_time < cutoff or not tx.get('meta') or "delivered_amount" not in tx["meta"]:
-                continue
-            meta = tx["meta"]
-            if isinstance(meta["delivered_amount"], dict) and meta["delivered_amount"]["currency"] == "XRP":
-                xrp = float(meta["delivered_amount"]["value"]) / 1_000_000
-                for node in meta.get("AffectedNodes", []):
-                    if ("ModifiedNode" in node and 
-                        node["ModifiedNode"].get("LedgerEntryType") == "RippleState" and 
-                        node["ModifiedNode"].get("FinalFields", {}).get("Balance", {}).get("currency") == currency and 
-                        node["ModifiedNode"].get("HighLimit", {}).get("issuer") == issuer):
-                        token = float(node["ModifiedNode"]["FinalFields"]["Balance"]["value"])
-                        if token != 0:
-                            prices.append(xrp / abs(token))
-        return sum(prices) / len(prices) if prices else None
-
-    for method in (get_dexscreener_price, get_dex_price, get_historical_price):
-        price = method()
-        if price and price > 0.000001:
-            return price
-    return 0.000001
-
-def get_lp_token_value(issuer, amount_held, transactions):
-    """Calculate LP token value based on AMM pool data."""
+def get_token_price_in_xrp(currency, issuer):
+    """Fetch the price of a token in XRP from the XRPL DEX order book using mid-price."""
     try:
-        amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
-        lp_tokens_issued = float(amm_info["lp_token"]["value"])
-        asset1 = amm_info["amount"]
-        asset2 = amm_info["amount2"]
+        # Fetch bid order book (buying token with XRP)
+        book_request_bids = BookOffers(
+            taker_gets={"currency": "XRP"},
+            taker_pays={"currency": currency, "issuer": issuer},
+            limit=1
+        )
+        book_response_bids = XRPL_CLIENT.request(book_request_bids)
+        bid_price = None
+        if book_response_bids.is_successful() and book_response_bids.result.get("offers"):
+            offer = book_response_bids.result["offers"][0]
+            taker_gets_xrp = float(drops_to_xrp(offer["TakerGets"]))  # XRP amount
+            taker_pays_token = float(offer["TakerPays"]["value"])  # Token amount
+            if taker_pays_token != 0:
+                bid_price = taker_gets_xrp / taker_pays_token  # XRP per token
+                logger.info(f"Bid price for {currency}/{issuer}: {bid_price} XRP/token "
+                           f"(XRP: {taker_gets_xrp}, Token: {taker_pays_token})")
 
-        if isinstance(asset1, str):  # XRP is asset1
-            amount_xrp = float(asset1) / 1_000_000
-            token_currency = asset2["currency"]
-            token_issuer = asset2["issuer"]
-            amount_token = float(asset2["value"])
-        elif isinstance(asset2, str):  # XRP is asset2
-            amount_xrp = float(asset2) / 1_000_000
-            token_currency = asset1["currency"]
-            token_issuer = asset1["issuer"]
-            amount_token = float(asset1["value"])
+        # Fetch ask order book (selling token for XRP)
+        book_request_asks = BookOffers(
+            taker_gets={"currency": currency, "issuer": issuer},
+            taker_pays={"currency": "XRP"},
+            limit=1
+        )
+        book_response_asks = XRPL_CLIENT.request(book_request_asks)
+        ask_price = None
+        if book_response_asks.is_successful() and book_response_asks.result.get("offers"):
+            offer = book_response_asks.result["offers"][0]
+            taker_gets_token = float(offer["TakerGets"]["value"])  # Token amount
+            taker_pays_xrp = float(drops_to_xrp(offer["TakerPays"]))  # XRP amount
+            if taker_gets_token != 0:
+                ask_price = taker_pays_xrp / taker_gets_token  # XRP per token
+                logger.info(f"Ask price for {currency}/{issuer}: {ask_price} XRP/token "
+                           f"(Token: {taker_gets_token}, XRP: {taker_pays_xrp})")
+
+        # Calculate mid-price or fallback
+        if bid_price is not None and ask_price is not None:
+            mid_price = (bid_price + ask_price) / 2
+            logger.info(f"Mid price for {currency}/{issuer}: {mid_price} XRP/token")
+            return mid_price
+        elif bid_price is not None:
+            logger.info(f"Using bid price for {currency}/{issuer}: {bid_price} XRP/token")
+            return bid_price
+        elif ask_price is not None:
+            logger.info(f"Using ask price for {currency}/{issuer}: {ask_price} XRP/token")
+            return ask_price
         else:
-            logger.warning(f"Both assets are tokens for {issuer}, not supported")
-            return 0
+            logger.warning(f"No valid order book data for {currency}/{issuer}")
+            return None
 
-        token_price = get_current_price(token_currency, token_issuer, transactions)
-        total_pool_value = amount_xrp + (amount_token * token_price)
-        value_per_lp = total_pool_value / lp_tokens_issued
-        return amount_held * value_per_lp
     except Exception as e:
-        logger.error(f"Error calculating LP token value for {issuer}: {e}")
-        return 0
+        logger.error(f"Error fetching price for {currency}/{issuer}: {str(e)}")
+        return None
 
-@app.route('/token_pnl', methods=['POST'])
-def get_token_pnl():
-    """Calculate token PNL, separating AMM LP tokens."""
-    data = request.json
-    address = data.get('address')
-
-    if not address:
-        return jsonify({'error': 'Wallet address is required'}), 400
-
+def get_amm_lp_token_value(amm_currency, amm_issuer):
+    """Calculate the value of an AMM LP token in XRP based on pool reserves."""
     try:
-        # Fetch transactions
-        transactions = []
-        marker = None
-        while True:
-            req = AccountTx(
-                account=address,
-                ledger_index_min=-1,
-                ledger_index_max=-1,
-                limit=100,
-                marker=marker,
-                forward=True
-            )
-            response = client.request(req)
-            result = response.result
-            for tx in result.get('transactions', []):
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                transactions.append(tx)
-            marker = result.get('marker')
-            if not marker:
-                break
+        amm_request = AMMInfo(
+            asset={"currency": "XRP"},
+            asset2={"currency": amm_currency, "issuer": amm_issuer}
+        )
+        amm_response = XRPL_CLIENT.request(amm_request)
 
-        # Fetch current holdings
-        req = AccountLines(account=address)
-        response = client.request(req)
-        lines = response.result['lines']
-        holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
-                    for line in lines if float(line['balance']) > 0.001}  # Filter dust
+        if not amm_response.is_successful() or not amm_response.result.get("amm"):
+            logger.warning(f"No AMM pool data for {amm_currency}/{amm_issuer}")
+            return None
 
-        xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
+        amm_data = amm_response.result["amm"]
+        lp_token_supply = float(amm_data["lp_token"]["value"])
+        asset1 = amm_data["amount"]
+        asset2 = amm_data["amount2"]
 
-        regular_tokens = []
-        amm_lp_tokens = []
-        for token, amount_held in holdings.items():
-            currency, issuer = token.split('-')
-            currency_name, is_amm_lp = decode_currency(currency, issuer)
-            buys = deque()
-            realized_pnl = 0.0
+        pool_value_xrp = 0
+        if isinstance(asset1, str):  # XRP
+            pool_value_xrp += float(drops_to_xrp(asset1))
+        else:  # Token
+            price = get_token_price_in_xrp(asset1["currency"], asset1["issuer"])
+            if price:
+                pool_value_xrp += float(asset1["value"]) * price
 
-            # Process transactions
-            for tx in transactions:
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                meta = tx.get('meta', {})
-                if isinstance(meta, dict):
-                    changes = get_balance_changes(meta, address)
-                    delta_xrp = changes.get('XRP', 0) / 1_000_000
-                    if token in changes:
-                        delta_token = changes[token]
-                        if delta_xrp < 0 and delta_token > 0:  # Buy
-                            price = -delta_xrp / delta_token
-                            buys.append({'amount': delta_token, 'price': price})
-                        elif delta_xrp > 0 and delta_token < 0:  # Sell
-                            sell_amount = -delta_token
-                            sell_value = delta_xrp
-                            while sell_amount > 0 and buys:
-                                buy = buys[0]
-                                if buy['amount'] <= sell_amount:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * buy['amount']
-                                    sell_amount -= buy['amount']
-                                    buys.popleft()
-                                else:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
-                                    buy['amount'] -= sell_amount
-                                    sell_amount = 0
+        if isinstance(asset2, str):  # XRP
+            pool_value_xrp += float(drops_to_xrp(asset2))
+        else:  # Token
+            price = get_token_price_in_xrp(asset2["currency"], asset2["issuer"])
+            if price:
+                pool_value_xrp += float(asset2["value"]) * price
 
-            cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
-            current_value = (get_lp_token_value(issuer, amount_held, transactions) if is_amm_lp 
-                            else amount_held * get_current_price(currency, issuer, transactions))
-            unrealized_pnl = current_value - cost_basis
-            total_pnl = realized_pnl + unrealized_pnl
+        if pool_value_xrp == 0 or lp_token_supply == 0:
+            logger.warning(f"Invalid pool value or LP supply for {amm_currency}/{amm_issuer}")
+            return None
 
-            token_data = {
-                'currency': currency_name,
-                'issuer': issuer,
-                'amount_held': amount_held,
-                'initial_investment': cost_basis,
-                'current_value': current_value,
-                'realized_pnl': realized_pnl,
-                'unrealized_pnl': unrealized_pnl,
-                'total_pnl': total_pnl
-            }
+        lp_token_value = pool_value_xrp / lp_token_supply
+        logger.info(f"LP token value for {amm_currency}/{amm_issuer}: {lp_token_value} XRP")
+        return lp_token_value
 
-            if is_amm_lp:
-                amm_lp_tokens.append(token_data)
-            else:
-                regular_tokens.append(token_data)
-
-        # Sort by current_value
-        regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
-        amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
-
-        return jsonify({
-            'xrp_balance': xrp_balance,
-            'tokens': regular_tokens,
-            'amm_lp_tokens': amm_lp_tokens
-        })
     except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error fetching AMM LP value for {amm_currency}/{amm_issuer}: {str(e)}")
+        return None
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0')
+def get_wallet_tokens(address):
+    """Fetch all tokens held by the XRPL wallet with current value in XRP."""
+    try:
+        if not address.startswith("r") or len(address) < 25 or len(address) > 35:
+            return {"error": "Invalid XRPL address format"}
+
+        response_data = {"tokens": [], "amm_lp_tokens": []}
+
+        # Fetch regular tokens (trust lines)
+        account_lines_request = AccountLines(account=address)
+        account_lines_response = XRPL_CLIENT.request(account_lines_request)
+        
+        if account_lines_response.is_successful():
+            for line in account_lines_response.result.get("lines", []):
+                amount_held = float(line["balance"])
+                price_in_xrp = get_token_price_in_xrp(line["currency"], line["account"])
+                current_value = amount_held * price_in_xrp if price_in_xrp is not None else None
+                token = {
+                    "currency": line["currency"],
+                    "issuer": line["account"],
+                    "amount_held": amount_held,
+                    "current_value": round(current_value, 6) if current_value is not None else None
+                }
+                response_data["tokens"].append(token)
+        else:
+            logger.error(f"Failed to fetch account lines: {account_lines_response.result}")
+            return {"error": "Failed to fetch regular tokens"}
+
+        # Fetch AMM LP tokens
+        account_objects_request = AccountObjects(account=address, type=AccountObjectType.AMM)
+        account_objects_response = XRPL_CLIENT.request(account_objects_request)
+
+        if account_objects_response.is_successful():
+            for obj in account_objects_response.result.get("account_objects", []):
+                if obj.get("LedgerEntryType") == "AMM":
+                    currency = obj.get("LPToken", {}).get("currency", "N/A")
+                    issuer = obj.get("LPToken", {}).get("issuer", "N/A")
+                    amount_held = float(obj.get("LPTokenBalance", {}).get("value", 0))
+                    lp_token_value = get_amm_lp_token_value(currency, issuer)
+                    current_value = amount_held * lp_token_value if lp_token_value is not None else None
+                    lp_token = {
+                        "currency": currency,
+                        "issuer": issuer,
+                        "amount_held": amount_held,
+                        "current_value": round(current_value, 6) if current_value is not None else None
+                    }
+                    response_data["amm_lp_tokens"].append(lp_token)
+        else:
+            logger.error(f"Failed to fetch account objects: {account_objects_response.result}")
+            return {"error": "Failed to fetch AMM LP tokens"}
+
+        return response_data
+
+    except Exception as e:
+        logger.error(f"Error fetching wallet tokens: {str(e)}")
+        return {"error": f"Server error: {str(e)}"}
+
+@app.route('/token_pnl', methods=['GET', 'POST', 'OPTIONS'])
+def token_pnl():
+    """API endpoint to fetch token balances and values for an XRPL wallet address."""
+    try:
+        if request.method == "OPTIONS":
+            return jsonify({}), 200
+
+        data = request.get_json()
+        address = data.get("address", "").strip()
+
+        if not address:
+            return jsonify({"error": "No address provided"}), 400
+
+        result = get_wallet_tokens(address)
+        if "error" in result:
+            return jsonify(result), 400
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f"Error in token_pnl endpoint: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
