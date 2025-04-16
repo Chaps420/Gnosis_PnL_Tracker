@@ -3,7 +3,6 @@ flask-cors
 xrpl-py
 requests
 gunicorn
-gevent
 aiohttp
 cachetools
 tenacity
