@@ -17,8 +17,12 @@ import binascii
 app = Flask(__name__)
 CORS(app)
 
-# Rate limiting to prevent abuse
-limiter = Limiter(app, key_func=get_remote_address, default_limits=["10 per minute"])
+# Rate limiting to prevent abuse (updated initialization)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["10 per minute"]
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -213,7 +217,7 @@ async def get_lp_token_value(issuer, amount_held, transactions):
         elif isinstance(asset2, str):
             amount_xrp = float(asset2) / 1_000_000
             token_currency = asset1["currency"]
-            token_issuer = asset1["issuer"]
+            token_issuer = axis1["issuer"]
             amount_token = float(asset1["value"])
         else:
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
