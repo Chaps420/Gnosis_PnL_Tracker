@@ -8,6 +8,11 @@ from collections import deque
 import logging
 import requests
 import binascii
+import psycopg2
+from psycopg2 import pool
+import json
+from functools import lru_cache
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -22,6 +27,15 @@ client = JsonRpcClient(JSON_RPC_URL)
 
 # DEX Screener API setup
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
+
+# PostgreSQL connection pool setup
+db_pool = psycopg2.pool.SimpleConnectionPool(
+    1, 20,
+    user="xrpl_db_user",
+    password="rxJrwtYv8E0vybNI5UfBPwh6J0vKOneL",
+    host="dpg-cvu7p4buibrs73eji4dg-a",
+    database="xrpl_db"
+)
 
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
@@ -105,8 +119,9 @@ def get_balance_changes(meta, address):
                     changes[token_key] = changes.get(token_key, 0) + (-balance if low == address else balance)
     return changes
 
-def get_current_price(currency, issuer, transactions):
-    """Fetch current token price in XRP with fallbacks."""
+@lru_cache(maxsize=1000)
+def get_current_price(currency, issuer, cache_key):
+    """Fetch current token price in XRP with fallbacks, cached for 5 minutes."""
     decoded_currency = decode_hex_currency(currency)
 
     def get_dexscreener_price():
@@ -156,7 +171,7 @@ def get_current_price(currency, issuer, transactions):
             logger.error(f"XRPL DEX price error for {currency}-{issuer}: {e}")
             return 0.000001
 
-    def get_historical_price():
+    def get_historical_price(transactions):
         prices = []
         cutoff = datetime.utcnow() - timedelta(days=30)
         for tx in transactions:
@@ -176,7 +191,22 @@ def get_current_price(currency, issuer, transactions):
                             prices.append(xrp / abs(token))
         return sum(prices) / len(prices) if prices else None
 
-    for method in (get_dexscreener_price, get_dex_price, get_historical_price):
+    # Fetch transactions from DB for historical price
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tx_data FROM transactions WHERE wallet_address = %s ORDER BY tx_date DESC",
+                (cache_key,)
+            )
+            transactions = [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        logger.error(f"Database error fetching transactions: {e}")
+        transactions = []
+    finally:
+        db_pool.putconn(conn)
+
+    for method in (get_dexscreener_price, get_dex_price, lambda: get_historical_price(transactions)):
         price = method()
         if price and price > 0.000001:
             return price
@@ -204,13 +234,58 @@ def get_lp_token_value(issuer, amount_held, transactions):
             logger.warning(f"Both assets are tokens for {issuer}, not supported")
             return 0
 
-        token_price = get_current_price(token_currency, token_issuer, transactions)
+        token_price = get_current_price(token_currency, token_issuer, f"{token_currency}-{token_issuer}")
         total_pool_value = amount_xrp + (amount_token * token_price)
         value_per_lp = total_pool_value / lp_tokens_issued
         return amount_held * value_per_lp
     except Exception as e:
         logger.error(f"Error calculating LP token value for {issuer}: {e}")
         return 0
+
+def fetch_and_store_transactions(address):
+    """Fetch transactions from XRPL and store in PostgreSQL."""
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            transactions = []
+            marker = None
+            while True:
+                req = AccountTx(
+                    account=address,
+                    ledger_index_min=-1,
+                    ledger_index_max=-1,
+                    limit=100,
+                    marker=marker,
+                    forward=True
+                )
+                response = client.request(req)
+                result = response.result
+                for tx in result.get('transactions', []):
+                    tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                    tx_hash = tx.get('tx', {}).get('hash')
+                    if tx_hash:
+                        transactions.append((address, tx_hash, tx, tx_time))
+                marker = result.get('marker')
+                if not marker:
+                    break
+
+            # Store transactions in database
+            for addr, tx_hash, tx_data, tx_time in transactions:
+                cur.execute(
+                    """
+                    INSERT INTO transactions (wallet_address, tx_hash, tx_data, tx_date)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (tx_hash) DO NOTHING
+                    """,
+                    (addr, tx_hash, json.dumps(tx_data), tx_time)
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error fetching/storing transactions: {e}")
+        conn.rollback()
+    finally:
+        db_pool.putconn(conn)
+    return transactions
 
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
@@ -222,26 +297,38 @@ def get_token_pnl():
         return jsonify({'error': 'Wallet address is required'}), 400
 
     try:
-        # Fetch transactions
+        # Check if recent transactions exist in DB
+        conn = db_pool.getconn()
         transactions = []
-        marker = None
-        while True:
-            req = AccountTx(
-                account=address,
-                ledger_index_min=-1,
-                ledger_index_max=-1,
-                limit=100,
-                marker=marker,
-                forward=True
-            )
-            response = client.request(req)
-            result = response.result
-            for tx in result.get('transactions', []):
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                transactions.append(tx)
-            marker = result.get('marker')
-            if not marker:
-                break
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT tx_data, tx_date
+                    FROM transactions
+                    WHERE wallet_address = %s
+                    AND fetched_at > %s
+                    ORDER BY tx_date DESC
+                    """,
+                    (address, datetime.utcnow() - timedelta(hours=1))
+                )
+                transactions = [row[0] for row in cur.fetchall()]
+        finally:
+            db_pool.putconn(conn)
+
+        # If no recent transactions, fetch and store new ones
+        if not transactions:
+            fetch_and_store_transactions(address)
+            conn = db_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT tx_data FROM transactions WHERE wallet_address = %s ORDER BY tx_date DESC",
+                        (address,)
+                    )
+                    transactions = [row[0] for row in cur.fetchall()]
+            finally:
+                db_pool.putconn(conn)
 
         # Fetch current holdings
         req = AccountLines(account=address)
@@ -288,7 +375,7 @@ def get_token_pnl():
 
             cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
             current_value = (get_lp_token_value(issuer, amount_held, transactions) if is_amm_lp 
-                            else amount_held * get_current_price(currency, issuer, transactions))
+                            else amount_held * get_current_price(currency, issuer, f"{currency}-{issuer}"))
             unrealized_pnl = current_value - cost_basis
             total_pnl = realized_pnl + unrealized_pnl
 
