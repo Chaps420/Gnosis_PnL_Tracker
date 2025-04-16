@@ -181,11 +181,10 @@ async def get_current_price(currency, issuer, transactions):
                             prices.append(xrp / abs(token))
         return sum(prices) / len(prices) if prices else None
 
-    loop = asyncio.get_event_loop()
     tasks = [
         fetch_dexscreener_price(decoded_currency),
-        loop.run_in_executor(None, get_dex_price),
-        loop.run_in_executor(None, get_historical_price)
+        asyncio.to_thread(get_dex_price),
+        asyncio.to_thread(get_historical_price)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for price in results:
@@ -246,108 +245,114 @@ def get_token_pnl():
         if cache_key in pnl_cache:
             return jsonify(pnl_cache[cache_key])
 
-        # Fetch transactions (limited to 30 days)
-        transactions = []
-        cutoff_time = datetime.utcnow() - timedelta(days=30)
-        marker = None
-        max_txs = 200
-        while len(transactions) < max_txs:
-            req = AccountTx(
-                account=address,
-                ledger_index_min=-1,
-                ledger_index_max=-1,
-                limit=50,
-                marker=marker,
-                forward=True
-            )
-            response = client.request(req)
-            result = response.result
-            for tx in result.get('transactions', []):
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                if tx_time < cutoff_time:
+        # Create new event loop for this request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Fetch transactions (limited to 30 days)
+            transactions = []
+            cutoff_time = datetime.utcnow() - timedelta(days=30)
+            marker = None
+            max_txs = 200
+            while len(transactions) < max_txs:
+                req = AccountTx(
+                    account=address,
+                    ledger_index_min=-1,
+                    ledger_index_max=-1,
+                    limit=50,
+                    marker=marker,
+                    forward=True
+                )
+                response = client.request(req)
+                result = response.result
+                for tx in result.get('transactions', []):
+                    tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                    if tx_time < cutoff_time:
+                        break
+                    transactions.append(tx)
+                marker = result.get('marker')
+                if not marker or tx_time < cutoff_time:
                     break
-                transactions.append(tx)
-            marker = result.get('marker')
-            if not marker or tx_time < cutoff_time:
-                break
 
-        # Fetch current holdings
-        req = AccountLines(account=address)
-        response = client.request(req)
-        lines = response.result['lines']
-        holdings = {f"{line['currency']}-{line['account']}": float(line['balance'])
-                    for line in lines if float(line['balance']) > 0.001}
+            # Fetch current holdings
+            req = AccountLines(account=address)
+            response = client.request(req)
+            lines = response.result['lines']
+            holdings = {f"{line['currency']}-{line['account']}": float(line['balance'])
+                        for line in lines if float(line['balance']) > 0.001}
 
-        xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
+            xrp_balance = sum(float(line['balance']) for line in lines if line['currency'] == 'XRP')
 
-        regular_tokens = []
-        amm_lp_tokens = []
-        loop = asyncio.get_event_loop()
-        for token, amount_held in holdings.items():
-            currency, issuer = token.split('-')
-            currency_name, is_amm_lp = decode_currency(currency, issuer)
-            buys = deque()
-            realized_pnl = 0.0
+            regular_tokens = []
+            amm_lp_tokens = []
+            for token, amount_held in holdings.items():
+                currency, issuer = token.split('-')
+                currency_name, is_amm_lp = decode_currency(currency, issuer)
+                buys = deque()
+                realized_pnl = 0.0
 
-            for tx in transactions:
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                meta = tx.get('meta', {})
-                if isinstance(meta, dict):
-                    changes = get_balance_changes(meta, address)
-                    delta_xrp = changes.get('XRP', 0) / 1_000_000
-                    if token in changes:
-                        delta_token = changes[token]
-                        if delta_xrp < 0 and delta_token > 0:  # Buy
-                            price = -delta_xrp / delta_token
-                            buys.append({'amount': delta_token, 'price': price})
-                        elif delta_xrp > 0 and delta_token < 0:  # Sell
-                            sell_amount = -delta_token
-                            sell_value = delta_xrp
-                            while sell_amount > 0 and buys:
-                                buy = buys[0]
-                                if buy['amount'] <= sell_amount:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * buy['amount']
-                                    sell_amount -= buy['amount']
-                                    buys.popleft()
-                                else:
-                                    realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
-                                    buy['amount'] -= sell_amount
-                                    sell_amount = 0
+                for tx in transactions:
+                    tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                    meta = tx.get('meta', {})
+                    if isinstance(meta, dict):
+                        changes = get_balance_changes(meta, address)
+                        delta_xrp = changes.get('XRP', 0) / 1_000_000
+                        if token in changes:
+                            delta_token = changes[token]
+                            if delta_xrp < 0 and delta_token > 0:  # Buy
+                                price = -delta_xrp / delta_token
+                                buys.append({'amount': delta_token, 'price': price})
+                            elif delta_xrp > 0 and delta_token < 0:  # Sell
+                                sell_amount = -delta_token
+                                sell_value = delta_xrp
+                                while sell_amount > 0 and buys:
+                                    buy = buys[0]
+                                    if buy['amount'] <= sell_amount:
+                                        realized_pnl += (sell_value / sell_amount - buy['price']) * buy['amount']
+                                        sell_amount -= buy['amount']
+                                        buys.popleft()
+                                    else:
+                                        realized_pnl += (sell_value / sell_amount - buy['price']) * sell_amount
+                                        buy['amount'] -= sell_amount
+                                        sell_amount = 0
 
-            cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
-            current_value = (loop.run_until_complete(get_lp_token_value(issuer, amount_held, transactions)) if is_amm_lp
-                            else amount_held * loop.run_until_complete(get_current_price(currency, issuer, transactions)))
-            unrealized_pnl = current_value - cost_basis
-            total_pnl = realized_pnl + unrealized_pnl
+                cost_basis = sum(buy['amount'] * buy['price'] for buy in buys)
+                current_value = (loop.run_until_complete(get_lp_token_value(issuer, amount_held, transactions)) if is_amm_lp
+                                else amount_held * loop.run_until_complete(get_current_price(currency, issuer, transactions)))
+                unrealized_pnl = current_value - cost_basis
+                total_pnl = realized_pnl + unrealized_pnl
 
-            token_data = {
-                'currency': currency_name,
-                'issuer': issuer,
-                'amount_held': amount_held,
-                'initial_investment': cost_basis,
-                'current_value': current_value,
-                'realized_pnl': realized_pnl,
-                'unrealized_pnl': unrealized_pnl,
-                'total_pnl': total_pnl
+                token_data = {
+                    'currency': currency_name,
+                    'issuer': issuer,
+                    'amount_held': amount_held,
+                    'initial_investment': cost_basis,
+                    'current_value': current_value,
+                    'realized_pnl': realized_pnl,
+                    'unrealized_pnl': unrealized_pnl,
+                    'total_pnl': total_pnl
+                }
+
+                if is_amm_lp:
+                    amm_lp_tokens.append(token_data)
+                else:
+                    regular_tokens.append(token_data)
+
+            regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
+            amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
+
+            result = {
+                'xrp_balance': xrp_balance,
+                'tokens': regular_tokens,
+                'amm_lp_tokens': amm_lp_tokens
             }
 
-            if is_amm_lp:
-                amm_lp_tokens.append(token_data)
-            else:
-                regular_tokens.append(token_data)
-
-        regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
-        amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
-
-        result = {
-            'xrp_balance': xrp_balance,
-            'tokens': regular_tokens,
-            'amm_lp_tokens': amm_lp_tokens
-        }
-
-        # Cache result
-        pnl_cache[cache_key] = result
-        return jsonify(result)
+            # Cache result
+            pnl_cache[cache_key] = result
+            return jsonify(result)
+        finally:
+            # Clean up event loop
+            loop.close()
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({
