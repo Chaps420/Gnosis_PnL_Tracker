@@ -5,6 +5,7 @@ from xrpl.models.requests import AccountLines, AccountObjects, BookOffers, AMMIn
 from xrpl.models.requests.account_objects import AccountObjectType
 from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
+import decimal
 
 app = Flask(__name__)
 
@@ -44,16 +45,29 @@ def get_token_price_in_xrp(currency, issuer, amount=1):
         total_price = 0
         total_quantity = 0
         for offer in book_response.result["offers"]:
-            taker_gets = float(offer["TakerGets"]["value"]) if isinstance(offer["TakerGets"], dict) else drops_to_xrp(offer["TakerGets"])
-            taker_pays = float(offer["TakerPays"]["value"]) if isinstance(offer["TakerPays"], dict) else drops_to_xrp(offer["TakerPays"])
-            price = taker_pays / taker_gets  # Price in XRP per token
+            # Handle taker_gets (XRP or token)
+            if isinstance(offer["TakerGets"], dict):
+                taker_gets = float(offer["TakerGets"]["value"])
+            else:
+                taker_gets = float(drops_to_xrp(offer["TakerGets"]))
+
+            # Handle taker_pays (token)
+            if isinstance(offer["TakerPays"], dict):
+                taker_pays = float(offer["TakerPays"]["value"])
+            else:
+                taker_pays = float(drops_to_xrp(offer["TakerPays"]))
+
+            # Ensure both are floats to avoid decimal.Decimal issues
+            price = taker_pays / taker_gets if taker_gets != 0 else 0
             total_price += price * taker_gets
             total_quantity += taker_gets
 
         if total_quantity == 0:
+            logger.warning(f"No valid quantity for {currency}/{issuer}")
             return None
 
         avg_price = total_price / total_quantity
+        logger.info(f"Price for {currency}/{issuer}: {avg_price} XRP")
         return avg_price
 
     except Exception as e:
@@ -82,27 +96,29 @@ def get_amm_lp_token_value(amm_currency, amm_issuer):
         # Calculate total pool value in XRP
         pool_value_xrp = 0
 
-        # Asset1 (XRP)
+        # Asset1 (XRP or token)
         if isinstance(asset1, str):  # XRP
-            pool_value_xrp += drops_to_xrp(asset1)
+            pool_value_xrp += float(drops_to_xrp(asset1))
         else:  # Token
             price = get_token_price_in_xrp(asset1["currency"], asset1["issuer"])
             if price:
                 pool_value_xrp += float(asset1["value"]) * price
 
-        # Asset2 (Token)
+        # Asset2 (XRP or token)
         if isinstance(asset2, str):  # XRP
-            pool_value_xrp += drops_to_xrp(asset2)
+            pool_value_xrp += float(drops_to_xrp(asset2))
         else:  # Token
             price = get_token_price_in_xrp(asset2["currency"], asset2["issuer"])
             if price:
                 pool_value_xrp += float(asset2["value"]) * price
 
         if pool_value_xrp == 0 or lp_token_supply == 0:
+            logger.warning(f"Invalid pool value or LP supply for {amm_currency}/{amm_issuer}")
             return None
 
         # Value per LP token in XRP
         lp_token_value = pool_value_xrp / lp_token_supply
+        logger.info(f"LP token value for {amm_currency}/{amm_issuer}: {lp_token_value} XRP")
         return lp_token_value
 
     except Exception as e:
