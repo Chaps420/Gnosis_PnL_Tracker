@@ -49,29 +49,22 @@ def get_balance_changes(meta, wallet):
             entry = node['ModifiedNode']
             if entry['LedgerEntryType'] == 'AccountRoot' and entry['FinalFields'].get('Account') == wallet:
                 final_balance = int(entry['FinalFields']['Balance'])
-                previous_balance = int(entry['PreviousFields'].get('Balance', entry['FinalFields']['Balance']))
+                previous_balance = int(entry['PreviousFields'].get('Balance', final_balance))
                 xrp_change = (final_balance - previous_balance) / 1_000_000
                 if xrp_change != 0:
                     changes['XRP'] = changes.get('XRP', 0) + xrp_change
             elif entry['LedgerEntryType'] == 'RippleState':
-                low_issuer = entry['FinalFields']['LowLimit'].get('issuer')
-                high_issuer = entry['FinalFields']['HighLimit'].get('issuer')
-                if low_issuer == wallet:
+                low_limit = entry['FinalFields'].get('LowLimit', {})
+                high_limit = entry['FinalFields'].get('HighLimit', {})
+                low_issuer = low_limit.get('issuer')
+                high_issuer = high_limit.get('issuer')
+                if low_issuer == wallet and high_issuer:
                     currency = entry['FinalFields']['Balance']['currency']
-                    balance_issuer = entry['FinalFields']['Balance'].get('issuer', 'rrrrrrrrrrrrrrrrrrrrBZbvji')
-                    token_key = f"{currency}/{balance_issuer}"
+                    token_key = f"{currency}/{high_issuer}"
                     final_value = float(entry['FinalFields']['Balance']['value'])
-                    previous_value = float(entry['PreviousFields']['Balance']['value'])
-                    token_change = -(final_value - previous_value)  # for low, delta_T = - delta_B
-                    if token_change != 0:
-                        changes[token_key] = changes.get(token_key, 0) + token_change
-                elif high_issuer == wallet:
-                    currency = entry['FinalFields']['Balance']['currency']
-                    balance_issuer = entry['FinalFields']['Balance'].get('issuer', 'rrrrrrrrrrrrrrrrrrrrBZbvji')
-                    token_key = f"{currency}/{balance_issuer}"
-                    final_value = float(entry['FinalFields']['Balance']['value'])
-                    previous_value = float(entry['PreviousFields']['Balance']['value'])
-                    token_change = final_value - previous_value  # for high, delta_T = delta_B
+                    previous_balance_dict = entry['PreviousFields'].get('Balance', {})
+                    previous_value = float(previous_balance_dict.get('value', final_value))
+                    token_change = -(final_value - previous_value)
                     if token_change != 0:
                         changes[token_key] = changes.get(token_key, 0) + token_change
     return changes
@@ -295,15 +288,18 @@ def get_wallet_tokens(address):
         account_lines_response = XRPL_CLIENT.request(account_lines_request)
         if account_lines_response.is_successful():
             for line in account_lines_response.result.get("lines", []):
+                if "account" not in line:
+                    logger.warning(f"Missing 'account' in line: {line}")
+                    continue
                 amount_held = float(line["balance"])
-                price_in_xrp = get_token_price_in_xrp(line["currency"], line["issuer"])
+                price_in_xrp = get_token_price_in_xrp(line["currency"], line["account"])
                 current_value = amount_held * price_in_xrp if price_in_xrp is not None else None
                 token = {
                     "currency": line["currency"],
-                    "issuer": line["issuer"],
+                    "issuer": line["account"],
                     "amount_held": amount_held,
                     "current_value": round(current_value, 6) if current_value is not None else None,
-                    "initial_investment": None  # Placeholder
+                    "initial_investment": None
                 }
                 response_data["tokens"].append(token)
         else:
@@ -329,7 +325,7 @@ def get_wallet_tokens(address):
                         "issuer": issuer,
                         "amount_held": amount_held,
                         "current_value": round(current_value, 6) if current_value is not None else None,
-                        "initial_investment": None  # Placeholder
+                        "initial_investment": None
                     }
                     response_data["amm_lp_tokens"].append(lp_token)
         else:
