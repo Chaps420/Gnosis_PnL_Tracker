@@ -10,7 +10,7 @@ import requests
 import binascii
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Keep simple CORS setup to avoid syntax errors
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,7 +37,14 @@ def decode_currency(currency, issuer):
     """Decode currency and identify AMM LP tokens using AMMInfo."""
     if len(currency) == 40 and all(c in '0123456789ABCDEFabcdef' for c in currency):
         try:
-            amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+            response = client.request(AMMInfo(amm_account=issuer))
+            if not response.is_successful():
+                logger.debug(f"AMMInfo request failed for {issuer}: {response.result}")
+                return decode_hex_currency(currency), False
+            amm_info = response.result.get("amm")
+            if not amm_info:
+                logger.debug(f"No 'amm' field in AMMInfo response for {issuer}")
+                return decode_hex_currency(currency), False
             required_fields = ["lp_token", "amount", "amount2"]
             if all(field in amm_info for field in required_fields):
                 asset1 = amm_info["amount"]
@@ -46,6 +53,7 @@ def decode_currency(currency, issuer):
                 asset2_str = "XRP" if isinstance(asset2, str) else decode_hex_currency(asset2["currency"])
                 return f"LP_{asset1_str}_{asset2_str}", True
             else:
+                logger.debug(f"Missing required fields in AMMInfo for {issuer}: {amm_info}")
                 return decode_hex_currency(currency), False
         except Exception as e:
             logger.debug(f"AMMInfo failed for {issuer}: {e}")
@@ -185,7 +193,17 @@ def get_current_price(currency, issuer, transactions):
 def get_lp_token_value(issuer, amount_held, transactions):
     """Calculate LP token value based on AMM pool data."""
     try:
-        amm_info = client.request(AMMInfo(amm_account=issuer)).result["amm"]
+        response = client.request(AMMInfo(amm_account=issuer))
+        if not response.is_successful():
+            logger.debug(f"AMMInfo request failed for {issuer}: {response.result}")
+            return 0
+        amm_info = response.result.get("amm")
+        if not amm_info:
+            logger.debug(f"No 'amm' field in AMMInfo response for {issuer}")
+            return 0
+        if "lp_token" not in amm_info or "amount" not in amm_info or "amount2" not in amm_info:
+            logger.debug(f"Missing required fields in AMMInfo for {issuer}: {amm_info}")
+            return 0
         lp_tokens_issued = float(amm_info["lp_token"]["value"])
         asset1 = amm_info["amount"]
         asset2 = amm_info["amount2"]
@@ -206,7 +224,7 @@ def get_lp_token_value(issuer, amount_held, transactions):
 
         token_price = get_current_price(token_currency, token_issuer, transactions)
         total_pool_value = amount_xrp + (amount_token * token_price)
-        value_per_lp = total_pool_value / lp_tokens_issued
+        value_per_lp = total_pool_value / lp_tokens_issued if lp_tokens_issued > 0 else 0
         return amount_held * value_per_lp
     except Exception as e:
         logger.error(f"Error calculating LP token value for {issuer}: {e}")
@@ -246,7 +264,7 @@ def get_token_pnl():
         # Fetch current holdings
         req = AccountLines(account=address)
         response = client.request(req)
-        lines = response.result['lines']
+        lines = response.result.get('lines', [])
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
                     for line in lines if float(line['balance']) > 0.001}  # Filter dust
 
