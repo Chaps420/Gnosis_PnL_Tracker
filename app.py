@@ -99,8 +99,14 @@ def get_transactions_since(address, start_ripple_time, tx_type=None):
         if not response.is_successful():
             logger.error(f"Failed to fetch transactions for {address}")
             break
+        if 'transactions' not in response.result:
+            logger.error(f"No transactions found for {address}")
+            break
         txs = response.result['transactions']
         for tx in txs:
+            if 'tx' not in tx:
+                logger.warning(f"Transaction missing 'tx' key: {tx}")
+                continue
             if tx['tx']['date'] >= start_ripple_time:
                 if tx_type is None or tx['tx']['TransactionType'] == tx_type:
                     transactions.append(tx)
