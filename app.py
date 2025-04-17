@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
-        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
+        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
-XRPL_CLIENT = JsonRpcClient("[invalid url, do not cite])  # Mainnet
+XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
 
 # Ripple epoch for time conversion
 ripple_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -296,11 +296,11 @@ def get_wallet_tokens(address):
         if account_lines_response.is_successful():
             for line in account_lines_response.result.get("lines", []):
                 amount_held = float(line["balance"])
-                price_in_xrp = get_token_price_in_xrp(line["currency"], line["issuer"])  # Changed from line["account"]
+                price_in_xrp = get_token_price_in_xrp(line["currency"], line["issuer"])
                 current_value = amount_held * price_in_xrp if price_in_xrp is not None else None
                 token = {
                     "currency": line["currency"],
-                    "issuer": line["issuer"],  # Changed from line["account"]
+                    "issuer": line["issuer"],
                     "amount_held": amount_held,
                     "current_value": round(current_value, 6) if current_value is not None else None,
                     "initial_investment": None  # Placeholder
@@ -384,7 +384,7 @@ def token_pnl():
 # Ensure CORS headers for all responses
 @app.after_request
 def after_request(response):
-    response.headers['Access-Control-Allow-Origin'] = '[invalid url, do not cite]
+    response.headers['Access-Control-Allow-Origin'] = 'https://chaps420.github.io'
     response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
