@@ -1,8 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from xrpl.clients import JsonRpcClient
-from xrpl.models.requests import AccountLines, AccountObjects, BookOffers, AMMInfo, AccountTx
-from xrpl.models.requests.account_objects import AccountObjectType
+from xrpl.models.requests import AccountLines, BookOffers, AMMInfo, AccountTx
 from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
 from datetime import datetime, timezone
@@ -12,7 +11,7 @@ app = Flask(__name__)
 # Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
-        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
+        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -23,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
-XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
+XRPL_CLIENT = JsonRpcClient("[invalid url, do not cite])  # Mainnet
 
 # Ripple epoch for time conversion
 ripple_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -283,7 +282,7 @@ def get_wallet_tokens(address):
 
         response_data = {"tokens": [], "amm_lp_tokens": []}
 
-        # Fetch regular tokens
+        # Fetch all tokens using AccountLines
         account_lines_request = AccountLines(account=address)
         account_lines_response = XRPL_CLIENT.request(account_lines_request)
         if account_lines_response.is_successful():
@@ -301,56 +300,13 @@ def get_wallet_tokens(address):
                     "current_value": round(current_value, 6) if current_value is not None else None,
                     "initial_investment": None
                 }
-                response_data["tokens"].append(token)
+                if len(line["currency"]) == 40:
+                    response_data["amm_lp_tokens"].append(token)
+                else:
+                    response_data["tokens"].append(token)
         else:
             logger.error(f"Failed to fetch account lines: {account_lines_response.result}")
-            return {"error": "Failed to fetch regular tokens"}
-
-        # Fetch AMM LP tokens with robust error handling
-        account_objects_request = AccountObjects(
-            account=address,
-            type=AccountObjectType.AMM
-        )
-        account_objects_response = XRPL_CLIENT.request(account_objects_request)
-        if account_objects_response.is_successful():
-            logger.info(f"Full AccountObjects response: {account_objects_response.result}")
-            for obj in account_objects_response.result.get("account_objects", []):
-                if obj.get("LedgerEntryType") == "AMM":
-                    lp_token = obj.get("LPToken")
-                    if lp_token is None or not isinstance(lp_token, dict):
-                        logger.warning(f"Skipping AMM object with missing or invalid LPToken: {obj}")
-                        continue
-                    currency = lp_token.get("currency")
-                    issuer = lp_token.get("issuer")
-                    if currency is None or issuer is None:
-                        logger.warning(f"LPToken missing 'currency' or 'issuer': {lp_token}")
-                        continue
-                    lp_token_balance = obj.get("LPTokenBalance")
-                    if lp_token_balance is None or not isinstance(lp_token_balance, dict):
-                        logger.warning(f"Skipping AMM object with missing or invalid LPTokenBalance: {obj}")
-                        continue
-                    amount_held = lp_token_balance.get("value")
-                    if amount_held is None:
-                        logger.warning(f"LPTokenBalance missing 'value': {lp_token_balance}")
-                        continue
-                    try:
-                        amount_held = float(amount_held)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid LPTokenBalance value: {amount_held}")
-                        continue
-                    lp_token_value = get_amm_lp_token_value(currency, issuer)
-                    current_value = amount_held * lp_token_value if lp_token_value is not None else None
-                    lp_token_entry = {
-                        "currency": currency,
-                        "issuer": issuer,
-                        "amount_held": amount_held,
-                        "current_value": round(current_value, 6) if current_value is not None else None,
-                        "initial_investment": None
-                    }
-                    response_data["amm_lp_tokens"].append(lp_token_entry)
-        else:
-            logger.error(f"Failed to fetch account objects: {account_objects_response.result}")
-            return {"error": "Failed to fetch AMM LP tokens"}
+            return {"error": "Failed to fetch token balances"}
 
         # Calculate initial investments for regular tokens
         initial_investments_regular = get_initial_investments_regular_tokens(address, start_ripple_time)
@@ -400,7 +356,7 @@ def token_pnl():
 # Ensure CORS headers for all responses
 @app.after_request
 def after_request(response):
-    response.headers['Access-Control-Allow-Origin'] = 'https://chaps420.github.io'
+    response.headers['Access-Control-Allow-Origin'] = '[invalid url, do not cite]
     response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
