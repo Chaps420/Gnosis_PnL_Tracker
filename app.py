@@ -41,10 +41,10 @@ def get_balance_changes(meta, wallet):
         wallet (str): The XRPL wallet address.
     
     Returns:
-        dict: Balance changes where keys are 'XRP' or 'currency/issuer' and values are changes (positive = gain, negative = loss).
+        dict: Balance changes where keys are 'XRP' or 'currency/issuer' and values are changes.
     """
     changes = {}
-    for node in meta['AffectedNodes']:
+    for node in meta.get('AffectedNodes', []):
         if 'ModifiedNode' in node:
             entry = node['ModifiedNode']
             # XRP balance change
@@ -86,40 +86,43 @@ def get_transactions_since(address, start_ripple_time, tx_type=None):
         tx_type (str, optional): Filter by transaction type (e.g., "OfferCreate", "AMMDeposit").
     
     Returns:
-        list: List of transactions since the start time.
+        list: List of valid transactions since the start time.
     """
     transactions = []
     marker = None
     while True:
-        response = XRPL_CLIENT.request(AccountTx(
-            account=address,
-            limit=100,
-            marker=marker
-        ))
-        if not response.is_successful():
-            logger.error(f"Failed to fetch transactions for {address}")
-            break
-        if 'transactions' not in response.result:
-            logger.error(f"No transactions found for {address}")
-            break
-        txs = response.result['transactions']
-        for tx in txs:
-            if 'tx' not in tx:
-                logger.warning(f"Transaction missing 'tx' key: {tx}")
-                continue
-            if tx['tx']['date'] >= start_ripple_time:
-                if tx_type is None or tx['tx']['TransactionType'] == tx_type:
-                    transactions.append(tx)
-            else:
-                return transactions  # Stop if transactions are older than start time
-        marker = response.result.get('marker')
-        if not marker:
-            break
+        try:
+            response = XRPL_CLIENT.request(AccountTx(
+                account=address,
+                limit=100,
+                marker=marker
+            ))
+            if not response.is_successful():
+                logger.error(f"Failed to fetch transactions for {address}: {response.result}")
+                return transactions
+            if 'transactions' not in response.result or not response.result['transactions']:
+                logger.info(f"No transactions found for {address}")
+                return transactions
+            for tx in response.result['transactions']:
+                if 'tx' not in tx or 'date' not in tx['tx'] or 'TransactionType' not in tx['tx']:
+                    logger.warning(f"Skipping malformed transaction for {address}: {tx}")
+                    continue
+                if tx['tx']['date'] >= start_ripple_time:
+                    if tx_type is None or tx['tx']['TransactionType'] == tx_type:
+                        transactions.append(tx)
+                else:
+                    return transactions  # Stop if transactions are older than start time
+            marker = response.result.get('marker')
+            if not marker:
+                break
+        except Exception as e:
+            logger.error(f"Error fetching transactions for {address}: {str(e)}")
+            return transactions
     return transactions
 
 def get_initial_investments_regular_tokens(address, start_ripple_time):
     """
-    Calculate the total XRP spent on each regular token via OfferCreate transactions since the start time.
+    Calculate the total XRP spent on each regular token via OfferCreate transactions.
     
     Args:
         address (str): The XRPL wallet address.
@@ -142,7 +145,7 @@ def get_initial_investments_regular_tokens(address, start_ripple_time):
 
 def get_initial_investments_amm_lp_tokens(address, start_ripple_time):
     """
-    Calculate the total XRP contributed to AMM pools via AMMDeposit transactions since the start time.
+    Calculate the total XRP contributed to AMM pools via AMMDeposit transactions.
     
     Args:
         address (str): The XRPL wallet address.
@@ -177,14 +180,14 @@ def get_initial_investments_amm_lp_tokens(address, start_ripple_time):
                     else:
                         logger.warning(f"No price data for {currency}/{issuer}, marking investment as None")
                         token_contributed_value = None
-                        break  # Exit if price data is missing
+                        break
             total_contributed_xrp = None
             if xrp_contributed > 0 or token_contributed_value is not None:
                 total_contributed_xrp = xrp_contributed + (token_contributed_value if token_contributed_value is not None else 0)
             if lp_token_key and total_contributed_xrp is not None:
                 initial_investments[lp_token_key] = initial_investments.get(lp_token_key, 0) + total_contributed_xrp
             elif lp_token_key:
-                initial_investments[lp_token_key] = None  # Set to None if price data is unavailable
+                initial_investments[lp_token_key] = None
     return initial_investments
 
 def get_token_price_in_xrp(currency, issuer):
