@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
-        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
+        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
-XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
+XRPL_CLIENT = JsonRpcClient("[invalid url, do not cite])  # Mainnet
 
 # Ripple epoch for time conversion
 ripple_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -103,15 +103,19 @@ def get_transactions_since(address, start_ripple_time, tx_type=None):
             if 'transactions' not in response.result or not response.result['transactions']:
                 logger.info(f"No transactions found for {address}")
                 return transactions
-            for tx in response.result['transactions']:
-                if 'tx' not in tx or 'date' not in tx['tx'] or 'TransactionType' not in tx['tx']:
-                    logger.warning(f"Skipping malformed transaction for {address}: {tx}")
+            for tx_entry in response.result['transactions']:
+                if 'tx' not in tx_entry and 'tx_json' in tx_entry:
+                    tx_entry['tx'] = tx_entry['tx_json']
+                if 'tx' not in tx_entry or not isinstance(tx_entry['tx'], dict):
+                    logger.warning(f"Skipping transaction without valid 'tx': {tx_entry}")
                     continue
-                if tx['tx']['date'] >= start_ripple_time:
-                    if tx_type is None or tx['tx']['TransactionType'] == tx_type:
-                        transactions.append(tx)
-                else:
-                    return transactions  # Stop if transactions are older than start time
+                tx = tx_entry['tx']
+                if 'date' not in tx or 'TransactionType' not in tx:
+                    logger.warning(f"Skipping transaction without 'date' or 'TransactionType': {tx_entry}")
+                    continue
+                if tx['date'] >= start_ripple_time:
+                    if tx_type is None or tx['TransactionType'] == tx_type:
+                        transactions.append(tx_entry)
             marker = response.result.get('marker')
             if not marker:
                 break
@@ -373,10 +377,17 @@ def token_pnl():
             return jsonify(result), 400
 
         return jsonify(result), 200
-
     except Exception as e:
         logger.error(f"Error in token_pnl endpoint: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+# Ensure CORS headers for all responses
+@app.after_request
+def after_request(response):
+    response.headers['Access-Control-Allow-Origin'] = '[invalid url, do not cite]
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
