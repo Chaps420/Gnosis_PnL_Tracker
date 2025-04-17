@@ -1,8 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from xrpl.clients import JsonRpcClient
-from xrpl.models.requests import AccountLines, AccountObjects, BookOffers, AMMInfo, AccountTx
-from xrpl.models.requests.account_objects import AccountObjectType
+from xrpl.models.requests import AccountLines, BookOffers, AMMInfo, AccountTx
 from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
 from datetime import datetime, timezone
