@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
-        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
+        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
-XRPL_CLIENT = JsonRpcClient("[invalid url, do not cite])  # Mainnet
+XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
 
 # Ripple epoch for time conversion
 ripple_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -384,7 +384,7 @@ def token_pnl():
 # Ensure CORS headers for all responses
 @app.after_request
 def after_request(response):
-    response.headers['Access-Control-Allow-Origin'] = '[invalid url, do not cite]
+    response.headers['Access-Control-Allow-Origin'] = 'https://chaps420.github.io'
     response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
