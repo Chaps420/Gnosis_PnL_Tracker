@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Enable CORS for specific origins
 CORS(app, resources={
     r"/token_pnl": {
-        "origins": ["https://chaps420.github.io", "http://localhost:3000"],
+        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"]
     }
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # XRPL client (mainnet)
-XRPL_CLIENT = JsonRpcClient("https://s1.ripple.com:51234/")  # Mainnet
+XRPL_CLIENT = JsonRpcClient("[invalid url, do not cite])  # Mainnet
 
 # Ripple epoch for time conversion
 ripple_epoch = datetime(2000, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -47,32 +47,32 @@ def get_balance_changes(meta, wallet):
     for node in meta.get('AffectedNodes', []):
         if 'ModifiedNode' in node:
             entry = node['ModifiedNode']
-            # XRP balance change
-            if entry['LedgerEntryType'] == 'AccountRoot' and entry['FinalFields']['Account'] == wallet:
+            if entry['LedgerEntryType'] == 'AccountRoot' and entry['FinalFields'].get('Account') == wallet:
                 final_balance = int(entry['FinalFields']['Balance'])
-                previous_balance = int(entry['PreviousFields']['Balance'])
-                xrp_change = (final_balance - previous_balance) / 1_000_000  # Convert drops to XRP
+                previous_balance = int(entry['PreviousFields'].get('Balance', entry['FinalFields']['Balance']))
+                xrp_change = (final_balance - previous_balance) / 1_000_000
                 if xrp_change != 0:
                     changes['XRP'] = changes.get('XRP', 0) + xrp_change
-            # Token balance change
             elif entry['LedgerEntryType'] == 'RippleState':
-                if entry['FinalFields']['LowLimit']['Account'] == wallet:
+                low_issuer = entry['FinalFields']['LowLimit'].get('issuer')
+                high_issuer = entry['FinalFields']['HighLimit'].get('issuer')
+                if low_issuer == wallet:
                     currency = entry['FinalFields']['Balance']['currency']
-                    issuer = entry['FinalFields']['HighLimit']['Account']
+                    balance_issuer = entry['FinalFields']['Balance'].get('issuer', 'rrrrrrrrrrrrrrrrrrrrBZbvji')
+                    token_key = f"{currency}/{balance_issuer}"
                     final_value = float(entry['FinalFields']['Balance']['value'])
                     previous_value = float(entry['PreviousFields']['Balance']['value'])
-                    token_change = final_value - previous_value
+                    token_change = -(final_value - previous_value)  # for low, delta_T = - delta_B
                     if token_change != 0:
-                        token_key = f"{currency}/{issuer}"
                         changes[token_key] = changes.get(token_key, 0) + token_change
-                elif entry['FinalFields']['HighLimit']['Account'] == wallet:
+                elif high_issuer == wallet:
                     currency = entry['FinalFields']['Balance']['currency']
-                    issuer = entry['FinalFields']['LowLimit']['Account']
+                    balance_issuer = entry['FinalFields']['Balance'].get('issuer', 'rrrrrrrrrrrrrrrrrrrrBZbvji')
+                    token_key = f"{currency}/{balance_issuer}"
                     final_value = float(entry['FinalFields']['Balance']['value'])
                     previous_value = float(entry['PreviousFields']['Balance']['value'])
-                    token_change = -(final_value - previous_value)
+                    token_change = final_value - previous_value  # for high, delta_T = delta_B
                     if token_change != 0:
-                        token_key = f"{currency}/{issuer}"
                         changes[token_key] = changes.get(token_key, 0) + token_change
     return changes
 
@@ -296,11 +296,11 @@ def get_wallet_tokens(address):
         if account_lines_response.is_successful():
             for line in account_lines_response.result.get("lines", []):
                 amount_held = float(line["balance"])
-                price_in_xrp = get_token_price_in_xrp(line["currency"], line["account"])
+                price_in_xrp = get_token_price_in_xrp(line["currency"], line["issuer"])  # Changed from line["account"]
                 current_value = amount_held * price_in_xrp if price_in_xrp is not None else None
                 token = {
                     "currency": line["currency"],
-                    "issuer": line["account"],
+                    "issuer": line["issuer"],  # Changed from line["account"]
                     "amount_held": amount_held,
                     "current_value": round(current_value, 6) if current_value is not None else None,
                     "initial_investment": None  # Placeholder
@@ -384,7 +384,7 @@ def token_pnl():
 # Ensure CORS headers for all responses
 @app.after_request
 def after_request(response):
-    response.headers['Access-Control-Allow-Origin'] = 'https://chaps420.github.io'
+    response.headers['Access-Control-Allow-Origin'] = '[invalid url, do not cite]
     response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
