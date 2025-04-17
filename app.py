@@ -9,6 +9,7 @@ import logging
 import requests
 import binascii
 import time
+from cachetools import TTLCache
 
 app = Flask(__name__)
 CORS(app)  # Simple CORS setup to allow all origins
@@ -24,6 +25,18 @@ client = JsonRpcClient(JSON_RPC_URL)
 # DEX Screener API setup
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
 
+# Initialize caches
+# Cache for AccountTx (transactions): 5 minutes, up to 100 addresses
+account_tx_cache = TTLCache(maxsize=100, ttl=300)
+# Cache for AccountLines (balances): 5 minutes, up to 100 addresses
+account_lines_cache = TTLCache(maxsize=100, ttl=300)
+# Cache for AMMInfo: 30 minutes, up to 1000 issuers
+amm_info_cache = TTLCache(maxsize=1000, ttl=1800)
+# Cache for token prices: 1 minute, up to 1000 currency-issuer pairs
+price_cache = TTLCache(maxsize=1000, ttl=60)
+# Cache for full PNL responses: 5 minutes, up to 100 addresses
+pnl_cache = TTLCache(maxsize=100, ttl=300)
+
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
     if len(hex_code) == 40 and all(c in '0123456789ABCDEFabcdef' for c in hex_code):
@@ -35,31 +48,44 @@ def decode_hex_currency(hex_code):
     return hex_code
 
 def decode_currency(currency, issuer):
-    """Decode currency and identify AMM LP tokens using AMMInfo."""
-    if len(currency) == 40 and all(c in '0123456789ABCDEFabcdef' for c in currency):
+    """Decode currency and identify AMM LP tokens using AMMInfo with caching."""
+    if len(currency) != 40 or not all(c in '0123456789ABCDEFabcdef' for c in currency):
+        return currency, False
+
+    cache_key = f"amm_info:{issuer}"
+    if cache_key in amm_info_cache:
+        logger.debug(f"Cache hit for AMMInfo: {issuer}")
+        amm_info = amm_info_cache[cache_key]
+        if amm_info is None:
+            return decode_hex_currency(currency), False
+    else:
         try:
             response = client.request(AMMInfo(amm_account=issuer))
             if not response.is_successful():
                 logger.debug(f"AMMInfo request failed for {issuer}: {response.result}")
+                amm_info_cache[cache_key] = None
                 return decode_hex_currency(currency), False
             amm_info = response.result.get("amm")
             if not amm_info:
                 logger.debug(f"No 'amm' field in AMMInfo response for {issuer}")
+                amm_info_cache[cache_key] = None
                 return decode_hex_currency(currency), False
-            required_fields = ["lp_token", "amount", "amount2"]
-            if all(field in amm_info for field in required_fields):
-                asset1 = amm_info["amount"]
-                asset2 = amm_info["amount2"]
-                asset1_str = "XRP" if isinstance(asset1, str) else decode_hex_currency(asset1["currency"])
-                asset2_str = "XRP" if isinstance(asset2, str) else decode_hex_currency(asset2["currency"])
-                return f"LP_{asset1_str}_{asset2_str}", True
-            else:
-                logger.debug(f"Missing required fields in AMMInfo for {issuer}: {amm_info}")
-                return decode_hex_currency(currency), False
+            amm_info_cache[cache_key] = amm_info
         except Exception as e:
             logger.debug(f"AMMInfo failed for {issuer}: {e}")
+            amm_info_cache[cache_key] = None
             return decode_hex_currency(currency), False
-    return currency, False
+
+    required_fields = ["lp_token", "amount", "amount2"]
+    if all(field in amm_info for field in required_fields):
+        asset1 = amm_info["amount"]
+        asset2 = amm_info["amount2"]
+        asset1_str = "XRP" if isinstance(asset1, str) else decode_hex_currency(asset1["currency"])
+        asset2_str = "XRP" if isinstance(asset2, str) else decode_hex_currency(asset2["currency"])
+        return f"LP_{asset1_str}_{asset2_str}", True
+    else:
+        logger.debug(f"Missing required fields in AMMInfo for {issuer}: {amm_info}")
+        return decode_hex_currency(currency), False
 
 def get_balance_changes(meta, address):
     """Extract balance changes from transaction metadata."""
@@ -115,7 +141,12 @@ def get_balance_changes(meta, address):
     return changes
 
 def get_current_price(currency, issuer, transactions):
-    """Fetch current token price in XRP with fallbacks."""
+    """Fetch current token price in XRP with fallbacks and caching."""
+    cache_key = f"price:{currency}:{issuer}"
+    if cache_key in price_cache:
+        logger.debug(f"Cache hit for price: {currency}-{issuer}")
+        return price_cache[cache_key]
+
     decoded_currency = decode_hex_currency(currency)
 
     def get_dexscreener_price():
@@ -188,20 +219,33 @@ def get_current_price(currency, issuer, transactions):
     for method in (get_dexscreener_price, get_dex_price, get_historical_price):
         price = method()
         if price and price > 0.000001:
+            price_cache[cache_key] = price
             return price
+    price_cache[cache_key] = 0.000001
     return 0.000001
 
 def get_lp_token_value(issuer, amount_held, transactions):
     """Calculate LP token value based on AMM pool data."""
     try:
-        response = client.request(AMMInfo(amm_account=issuer))
-        if not response.is_successful():
-            logger.debug(f"AMMInfo request failed for {issuer}: {response.result}")
-            return 0
-        amm_info = response.result.get("amm")
-        if not amm_info:
-            logger.debug(f"No 'amm' field in AMMInfo response for {issuer}")
-            return 0
+        cache_key = f"amm_info:{issuer}"
+        if cache_key in amm_info_cache:
+            logger.debug(f"Cache hit for AMMInfo in get_lp_token_value: {issuer}")
+            amm_info = amm_info_cache[cache_key]
+            if amm_info is None:
+                return 0
+        else:
+            response = client.request(AMMInfo(amm_account=issuer))
+            if not response.is_successful():
+                logger.debug(f"AMMInfo request failed for {issuer}: {response.result}")
+                amm_info_cache[cache_key] = None
+                return 0
+            amm_info = response.result.get("amm")
+            if not amm_info:
+                logger.debug(f"No 'amm' field in AMMInfo response for {issuer}")
+                amm_info_cache[cache_key] = None
+                return 0
+            amm_info_cache[cache_key] = amm_info
+
         if "lp_token" not in amm_info or "amount" not in amm_info or "amount2" not in amm_info:
             logger.debug(f"Missing required fields in AMMInfo for {issuer}: {amm_info}")
             return 0
@@ -233,73 +277,90 @@ def get_lp_token_value(issuer, amount_held, transactions):
 
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
-    """Calculate token PNL, separating AMM LP tokens."""
+    """Calculate token PNL, separating AMM LP tokens, with caching."""
     data = request.json
     address = data.get('address')
 
     if not address:
         return jsonify({'error': 'Wallet address is required'}), 400
 
+    # Check PNL cache
+    cache_key = f"pnl:{address}"
+    if cache_key in pnl_cache:
+        logger.debug(f"Cache hit for PNL: {address}")
+        return jsonify(pnl_cache[cache_key])
+
     try:
         # Fetch transactions with retry
         transactions = []
-        marker = None
-        max_retries = 3
-        retry_delay = 2  # seconds
+        cache_key_tx = f"account_tx:{address}"
+        if cache_key_tx in account_tx_cache:
+            logger.debug(f"Cache hit for AccountTx: {address}")
+            transactions = account_tx_cache[cache_key_tx]
+        else:
+            marker = None
+            max_retries = 3
+            retry_delay = 2  # seconds
+            while True:
+                req = AccountTx(
+                    account=address,
+                    ledger_index_min=-1,
+                    ledger_index_max=-1,
+                    limit=100,
+                    marker=marker,
+                    forward=True
+                )
+                for attempt in range(max_retries):
+                    try:
+                        response = client.request(req)
+                        if not hasattr(response, 'result'):
+                            logger.error(f"XRPL response missing 'result' for AccountTx: {response.__dict__}")
+                            raise ValueError("Response missing 'result' key")
+                        result = response.result
+                        if 'error' in result:
+                            logger.error(f"XRPL error for AccountTx: {result['error']}")
+                            raise ValueError(f"XRPL error: {result['error']}")
+                        for tx in result.get('transactions', []):
+                            tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                            transactions.append(tx)
+                        marker = result.get('marker')
+                        break  # Success, exit retry loop
+                    except Exception as e:
+                        logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountTx: {str(e)}")
+                        if attempt + 1 == max_retries:
+                            logger.error(f"Failed to fetch AccountTx after {max_retries} attempts: {str(e)}")
+                            return jsonify({'error': 'Failed to fetch transactions from XRPL'}), 500
+                        time.sleep(retry_delay)
+                if not marker:
+                    break
+            account_tx_cache[cache_key_tx] = transactions
 
-        while True:
-            req = AccountTx(
-                account=address,
-                ledger_index_min=-1,
-                ledger_index_max=-1,
-                limit=100,
-                marker=marker,
-                forward=True
-            )
+        # Fetch current holdings with retry
+        cache_key_lines = f"account_lines:{address}"
+        if cache_key_lines in account_lines_cache:
+            logger.debug(f"Cache hit for AccountLines: {address}")
+            lines = account_lines_cache[cache_key_lines]
+        else:
+            req = AccountLines(account=address)
             for attempt in range(max_retries):
                 try:
                     response = client.request(req)
                     if not hasattr(response, 'result'):
-                        logger.error(f"XRPL response missing 'result' for AccountTx: {response.__dict__}")
+                        logger.error(f"XRPL response missing 'result' for AccountLines: {response.__dict__}")
                         raise ValueError("Response missing 'result' key")
                     result = response.result
                     if 'error' in result:
-                        logger.error(f"XRPL error for AccountTx: {result['error']}")
+                        logger.error(f"XRPL error for AccountLines: {result['error']}")
                         raise ValueError(f"XRPL error: {result['error']}")
-                    for tx in result.get('transactions', []):
-                        tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                        transactions.append(tx)
-                    marker = result.get('marker')
+                    lines = result.get('lines', [])
                     break  # Success, exit retry loop
                 except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountTx: {str(e)}")
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountLines: {str(e)}")
                     if attempt + 1 == max_retries:
-                        logger.error(f"Failed to fetch AccountTx after {max_retries} attempts: {str(e)}")
-                        return jsonify({'error': 'Failed to fetch transactions from XRPL'}), 500
+                        logger.error(f"Failed to fetch AccountLines after {max_retries} attempts: {str(e)}")
+                        return jsonify({'error': 'Failed to fetch account lines from XRPL'}), 500
                     time.sleep(retry_delay)
-            if not marker:
-                break
-
-        # Fetch current holdings with retry
-        req = AccountLines(account=address)
-        for attempt in range(max_retries):
-            try:
-                response = client.request(req)
-                if not hasattr(response, 'result'):
-                    logger.error(f"XRPL response missing 'result' for AccountLines: {response.__dict__}")
-                    raise ValueError("Response missing 'result' key")
-                result = response.result
-                if 'error' in result:
-                    logger.error(f"XRPL error for AccountLines: {result['error']}")
-                    raise ValueError(f"XRPL error: {result['error']}")
-                lines = result.get('lines', [])
-                break  # Success, exit retry loop
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountLines: {str(e)}")
-                if attempt + 1 == max_retries:
-                    logger.error(f"Failed to fetch AccountLines after {max_retries} attempts: {str(e)}")
-                    return jsonify({'error': 'Failed to fetch account lines from XRPL'}), 500
-                time.sleep(retry_delay)
+            account_lines_cache[cache_key_lines] = lines
 
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
                     for line in lines if float(line['balance']) > 0.001}  # Filter dust
@@ -366,11 +427,13 @@ def get_token_pnl():
         regular_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
         amm_lp_tokens.sort(key=lambda x: x['current_value'] if x['current_value'] is not None else 0, reverse=True)
 
-        return jsonify({
+        response = {
             'xrp_balance': xrp_balance,
             'tokens': regular_tokens,
             'amm_lp_tokens': amm_lp_tokens
-        })
+        }
+        pnl_cache[cache_key] = response
+        return jsonify(response)
     except Exception as e:
         logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
