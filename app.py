@@ -25,17 +25,15 @@ client = JsonRpcClient(JSON_RPC_URL)
 # DEX Screener API setup
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search"
 
+# Required tokens for access
+REQUIRED_TOKENS = {"UGA", "GNOSIS", "CULT", "OBEY", "FPT", "METH"}
+
 # Initialize caches
-# Cache for AccountTx (transactions): 5 minutes, up to 100 addresses
-account_tx_cache = TTLCache(maxsize=100, ttl=300)
-# Cache for AccountLines (balances): 5 minutes, up to 100 addresses
-account_lines_cache = TTLCache(maxsize=100, ttl=300)
-# Cache for AMMInfo: 30 minutes, up to 1000 issuers
-amm_info_cache = TTLCache(maxsize=1000, ttl=1800)
-# Cache for token prices: 1 minute, up to 1000 currency-issuer pairs
-price_cache = TTLCache(maxsize=1000, ttl=60)
-# Cache for full PNL responses: 5 minutes, up to 100 addresses
-pnl_cache = TTLCache(maxsize=100, ttl=300)
+account_tx_cache = TTLCache(maxsize=100, ttl=300)  # Transactions: 5 minutes
+account_lines_cache = TTLCache(maxsize=100, ttl=300)  # Balances: 5 minutes
+amm_info_cache = TTLCache(maxsize=1000, ttl=1800)  #
+price_cache = TTLCache(maxsize=1000, ttl=60)  # Prices: 1 minute
+pnl_cache = TTLCache(maxsize=100, ttl=300)  # PNL responses: 5 minutes
 
 def decode_hex_currency(hex_code):
     """Decode a 40-character hex currency code to ASCII."""
@@ -277,7 +275,7 @@ def get_lp_token_value(issuer, amount_held, transactions):
 
 @app.route('/token_pnl', methods=['POST'])
 def get_token_pnl():
-    """Calculate token PNL, separating AMM LP tokens, with caching."""
+    """Calculate token PNL, separating AMM LP tokens, with token gating and caching."""
     data = request.json
     address = data.get('address')
 
@@ -291,50 +289,6 @@ def get_token_pnl():
         return jsonify(pnl_cache[cache_key])
 
     try:
-        # Fetch transactions with retry
-        transactions = []
-        cache_key_tx = f"account_tx:{address}"
-        if cache_key_tx in account_tx_cache:
-            logger.debug(f"Cache hit for AccountTx: {address}")
-            transactions = account_tx_cache[cache_key_tx]
-        else:
-            marker = None
-            max_retries = 3
-            retry_delay = 2  # seconds
-            while True:
-                req = AccountTx(
-                    account=address,
-                    ledger_index_min=-1,
-                    ledger_index_max=-1,
-                    limit=100,
-                    marker=marker,
-                    forward=True
-                )
-                for attempt in range(max_retries):
-                    try:
-                        response = client.request(req)
-                        if not hasattr(response, 'result'):
-                            logger.error(f"XRPL response missing 'result' for AccountTx: {response.__dict__}")
-                            raise ValueError("Response missing 'result' key")
-                        result = response.result
-                        if 'error' in result:
-                            logger.error(f"XRPL error for AccountTx: {result['error']}")
-                            raise ValueError(f"XRPL error: {result['error']}")
-                        for tx in result.get('transactions', []):
-                            tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                            transactions.append(tx)
-                        marker = result.get('marker')
-                        break  # Success, exit retry loop
-                    except Exception as e:
-                        logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountTx: {str(e)}")
-                        if attempt + 1 == max_retries:
-                            logger.error(f"Failed to fetch AccountTx after {max_retries} attempts: {str(e)}")
-                            return jsonify({'error': 'Failed to fetch transactions from XRPL'}), 500
-                        time.sleep(retry_delay)
-                if not marker:
-                    break
-            account_tx_cache[cache_key_tx] = transactions
-
         # Fetch current holdings with retry
         cache_key_lines = f"account_lines:{address}"
         if cache_key_lines in account_lines_cache:
@@ -342,6 +296,8 @@ def get_token_pnl():
             lines = account_lines_cache[cache_key_lines]
         else:
             req = AccountLines(account=address)
+            max_retries = 3
+            retry_delay = 2  # seconds
             for attempt in range(max_retries):
                 try:
                     response = client.request(req)
@@ -361,6 +317,57 @@ def get_token_pnl():
                         return jsonify({'error': 'Failed to fetch account lines from XRPL'}), 500
                     time.sleep(retry_delay)
             account_lines_cache[cache_key_lines] = lines
+
+        # Check for required tokens
+        has_required_token = False
+        for line in lines:
+            if line.get('currency', '').upper() in REQUIRED_TOKENS:
+                has_required_token = True
+                break
+        if not has_required_token:
+            logger.info(f"Access denied for {address}: No required tokens (UGA, GNOSIS, CULT, OBEY, FPT, METH)")
+            return jsonify({
+                'error': 'Wallet must hold UGA, GNOSIS, CULT, OBEY, FPT, or METH to access PNL'
+            }), 403
+
+        # Fetch transactions with retry
+        transactions = []
+        cache_key_tx = f"account_tx:{address}"
+        if cache_key_tx in account_tx_cache:
+            logger.debug(f"Cache hit for AccountTx: {address}")
+            transactions = account_tx_cache[cache_key_tx]
+        else:
+            marker = None
+            for attempt in range(max_retries):
+                try:
+                    req = AccountTx(
+                        account=address,
+                        ledger_index_min=-1,
+                        ledger_index_max=-1,
+                        limit=100,
+                        marker=marker,
+                        forward=True
+                    )
+                    response = client.request(req)
+                    if not hasattr(response, 'result'):
+                        logger.error(f"XRPL response missing 'result' for AccountTx: {response.__dict__}")
+                        raise ValueError("Response missing 'result' key")
+                    result = response.result
+                    if 'error' in result:
+                        logger.error(f"XRPL error for AccountTx: {result['error']}")
+                        raise ValueError(f"XRPL error: {result['error']}")
+                    for tx in result.get('transactions', []):
+                        tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                        transactions.append(tx)
+                    marker = result.get('marker')
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountTx: {str(e)}")
+                    if attempt + 1 == max_retries:
+                        logger.error(f"Failed to fetch AccountTx after {max_retries} attempts: {str(e)}")
+                        return jsonify({'error': 'Failed to fetch transactions from XRPL'}), 500
+                    time.sleep(retry_delay)
+            account_tx_cache[cache_key_tx] = transactions
 
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
                     for line in lines if float(line['balance']) > 0.001}  # Filter dust
