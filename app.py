@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 # Enable CORS for specific origins - corrected to use dictionary for resources
-CORS(app, resources={r"/token_pnl": {"origins": ["[invalid url, do not cite] "[invalid url, do not cite],
-                                     "methods": ["GET", "POST", "OPTIONS"],
-                                     "allow_headers": ["Content-Type", "Authorization"]}})
+CORS(app, resources={r"/token_pnl": {
+    "origins": ["[invalid url, do not cite] "[invalid url, do not cite],
+    "methods": ["GET", "POST", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization"]
+}})
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -287,16 +289,19 @@ def get_wallet_tokens(address):
                     logger.warning(f"Missing 'account' in line: {line}")
                     continue
                 amount_held = float(line["balance"])
-                price_in_xrp = get_token_price_in_xrp(line["currency"], line["account"])
+                currency = line["currency"]
+                issuer = line["account"]
+                # Use AMMInfo for LP tokens, order book for regular tokens
+                price_in_xrp = get_amm_lp_token_value(currency, issuer) if len(currency) == 40 else get_token_price_in_xrp(currency, issuer)
                 current_value = amount_held * price_in_xrp if price_in_xrp is not None else None
                 token = {
-                    "currency": line["currency"],
-                    "issuer": line["account"],
+                    "currency": currency,
+                    "issuer": issuer,
                     "amount_held": amount_held,
                     "current_value": round(current_value, 6) if current_value is not None else None,
                     "initial_investment": None
                 }
-                if len(line["currency"]) == 40:
+                if len(currency) == 40:
                     response_data["amm_lp_tokens"].append(token)
                 else:
                     response_data["tokens"].append(token)
