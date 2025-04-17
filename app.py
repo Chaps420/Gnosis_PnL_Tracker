@@ -8,9 +8,10 @@ from collections import deque
 import logging
 import requests
 import binascii
+import time
 
 app = Flask(__name__)
-CORS(app)  # Keep simple CORS setup to avoid syntax errors
+CORS(app)  # Simple CORS setup to allow all origins
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -240,9 +241,12 @@ def get_token_pnl():
         return jsonify({'error': 'Wallet address is required'}), 400
 
     try:
-        # Fetch transactions
+        # Fetch transactions with retry
         transactions = []
         marker = None
+        max_retries = 3
+        retry_delay = 2  # seconds
+
         while True:
             req = AccountTx(
                 account=address,
@@ -252,19 +256,51 @@ def get_token_pnl():
                 marker=marker,
                 forward=True
             )
-            response = client.request(req)
-            result = response.result
-            for tx in result.get('transactions', []):
-                tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
-                transactions.append(tx)
-            marker = result.get('marker')
+            for attempt in range(max_retries):
+                try:
+                    response = client.request(req)
+                    if not hasattr(response, 'result'):
+                        logger.error(f"XRPL response missing 'result' for AccountTx: {response.__dict__}")
+                        raise ValueError("Response missing 'result' key")
+                    result = response.result
+                    if 'error' in result:
+                        logger.error(f"XRPL error for AccountTx: {result['error']}")
+                        raise ValueError(f"XRPL error: {result['error']}")
+                    for tx in result.get('transactions', []):
+                        tx_time = datetime.utcfromtimestamp(tx.get('tx', {}).get('date', 0) + 946684800)
+                        transactions.append(tx)
+                    marker = result.get('marker')
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountTx: {str(e)}")
+                    if attempt + 1 == max_retries:
+                        logger.error(f"Failed to fetch AccountTx after {max_retries} attempts: {str(e)}")
+                        return jsonify({'error': 'Failed to fetch transactions from XRPL'}), 500
+                    time.sleep(retry_delay)
             if not marker:
                 break
 
-        # Fetch current holdings
+        # Fetch current holdings with retry
         req = AccountLines(account=address)
-        response = client.request(req)
-        lines = response.result.get('lines', [])
+        for attempt in range(max_retries):
+            try:
+                response = client.request(req)
+                if not hasattr(response, 'result'):
+                    logger.error(f"XRPL response missing 'result' for AccountLines: {response.__dict__}")
+                    raise ValueError("Response missing 'result' key")
+                result = response.result
+                if 'error' in result:
+                    logger.error(f"XRPL error for AccountLines: {result['error']}")
+                    raise ValueError(f"XRPL error: {result['error']}")
+                lines = result.get('lines', [])
+                break  # Success, exit retry loop
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for AccountLines: {str(e)}")
+                if attempt + 1 == max_retries:
+                    logger.error(f"Failed to fetch AccountLines after {max_retries} attempts: {str(e)}")
+                    return jsonify({'error': 'Failed to fetch account lines from XRPL'}), 500
+                time.sleep(retry_delay)
+
         holdings = {f"{line['currency']}-{line['account']}": float(line['balance']) 
                     for line in lines if float(line['balance']) > 0.001}  # Filter dust
 
