@@ -306,26 +306,38 @@ def get_wallet_tokens(address):
             logger.error(f"Failed to fetch account lines: {account_lines_response.result}")
             return {"error": "Failed to fetch regular tokens"}
 
-        # Fetch AMM LP tokens
+        # Fetch AMM LP tokens with robust error handling
         account_objects_request = AccountObjects(
             account=address,
             type=AccountObjectType.AMM
         )
         account_objects_response = XRPL_CLIENT.request(account_objects_request)
         if account_objects_response.is_successful():
+            logger.info(f"Full AccountObjects response: {account_objects_response.result}")
             for obj in account_objects_response.result.get("account_objects", []):
                 if obj.get("LedgerEntryType") == "AMM":
                     lp_token = obj.get("LPToken")
-                    if not lp_token or not isinstance(lp_token, dict):
-                        logger.warning(f"Invalid or missing LPToken in AMM object: {obj}")
+                    if lp_token is None or not isinstance(lp_token, dict):
+                        logger.warning(f"Skipping AMM object with missing or invalid LPToken: {obj}")
                         continue
-                    currency = lp_token.get("currency", "N/A")
-                    issuer = lp_token.get("issuer", "N/A")
+                    currency = lp_token.get("currency")
+                    issuer = lp_token.get("issuer")
+                    if currency is None or issuer is None:
+                        logger.warning(f"LPToken missing 'currency' or 'issuer': {lp_token}")
+                        continue
                     lp_token_balance = obj.get("LPTokenBalance")
-                    if not lp_token_balance or not isinstance(lp_token_balance, dict):
-                        logger.warning(f"Invalid or missing LPTokenBalance in AMM object: {obj}")
+                    if lp_token_balance is None or not isinstance(lp_token_balance, dict):
+                        logger.warning(f"Skipping AMM object with missing or invalid LPTokenBalance: {obj}")
                         continue
-                    amount_held = float(lp_token_balance.get("value", 0))
+                    amount_held = lp_token_balance.get("value")
+                    if amount_held is None:
+                        logger.warning(f"LPTokenBalance missing 'value': {lp_token_balance}")
+                        continue
+                    try:
+                        amount_held = float(amount_held)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Invalid LPTokenBalance value: {amount_held}")
+                        continue
                     lp_token_value = get_amm_lp_token_value(currency, issuer)
                     current_value = amount_held * lp_token_value if lp_token_value is not None else None
                     lp_token_entry = {
@@ -337,7 +349,7 @@ def get_wallet_tokens(address):
                     }
                     response_data["amm_lp_tokens"].append(lp_token_entry)
         else:
-            logger.error(f"Failed to fetch account objects: {account_lines_response.result}")
+            logger.error(f"Failed to fetch account objects: {account_objects_response.result}")
             return {"error": "Failed to fetch AMM LP tokens"}
 
         # Calculate initial investments for regular tokens
