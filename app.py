@@ -1,21 +1,18 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from xrpl.clients import JsonRpcClient
-from xrpl.models.requests import AccountLines, BookOffers, AMMInfo, AccountTx
+from xrpl.models.requests import AccountLines, AccountObjects, BookOffers, AMMInfo, AccountTx
+from xrpl.models.requests.account_objects import AccountObjectType
 from xrpl.utils import xrp_to_drops, drops_to_xrp
 import logging
 from datetime import datetime, timezone
 
 app = Flask(__name__)
 
-# Enable CORS for specific origins
-CORS(app, resources={
-    r"/token_pnl": {
-        "origins": ["[invalid url, do not cite] "[invalid url, do not cite]
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# Enable CORS for specific origins - corrected to use dictionary for resources
+CORS(app, resources={r"/token_pnl": {"origins": ["[invalid url, do not cite] "[invalid url, do not cite],
+                                     "methods": ["GET", "POST", "OPTIONS"],
+                                     "allow_headers": ["Content-Type", "Authorization"]}})
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
